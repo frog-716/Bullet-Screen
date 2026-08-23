@@ -108,9 +108,10 @@ class HttpClient:
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
         self.warmup_attempted = False
         self.api_attempts: List[Dict[str, Any]] = []
+        self.network_retries = 0
 
     def diagnostics(self) -> Dict[str, Any]:
-        return {"buvid3_present": bool(self.buvid3), "buvid4_present": bool(self.buvid4), "sessdata_present": bool(self.sessdata), "uid": self.uid, "warmup_attempted": self.warmup_attempted, "cookie_names": sorted(set(self.cookie_values) | {cookie.name for cookie in self.cookie_jar}), "api_attempts": list(self.api_attempts)}
+        return {"buvid3_present": bool(self.buvid3), "buvid4_present": bool(self.buvid4), "sessdata_present": bool(self.sessdata), "uid": self.uid, "warmup_attempted": self.warmup_attempted, "cookie_names": sorted(set(self.cookie_values) | {cookie.name for cookie in self.cookie_jar}), "api_attempts": list(self.api_attempts), "network_retries": self.network_retries}
 
     @property
     def cookie(self) -> str:
@@ -133,7 +134,7 @@ class HttpClient:
         try:
             with self.opener.open(request, timeout=15) as response:
                 response.read(4096)
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ssl.SSLError, OSError):
             # Homepage warm-up is best effort; the API calls below provide the
             # authoritative error and may still work with a supplied Cookie.
             return
@@ -152,14 +153,20 @@ class HttpClient:
         if headers:
             request_headers.update(headers)
         request = urllib.request.Request(url, headers=request_headers)
-        try:
-            with self.opener.open(request, timeout=timeout) as response:
-                payload = response.read()
-        except urllib.error.HTTPError as error:
-            detail = error.read(300).decode("utf-8", "replace")
-            raise ProtocolError(f"HTTP {error.code}: {detail}") from error
-        except urllib.error.URLError as error:
-            raise ProtocolError(f"network error: {error.reason}") from error
+        for attempt in range(3):
+            try:
+                with self.opener.open(request, timeout=timeout) as response:
+                    payload = response.read()
+                break
+            except urllib.error.HTTPError as error:
+                detail = error.read(300).decode("utf-8", "replace")
+                raise ProtocolError(f"HTTP {error.code}: {detail}") from error
+            except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as error:
+                if attempt >= 2:
+                    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+                    raise ProtocolError(f"network error after 3 attempts: {reason}") from error
+                self.network_retries += 1
+                time.sleep(0.25 * (attempt + 1))
         try:
             result = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -672,6 +679,8 @@ class Collector:
         client = HttpClient(sessdata=self.sessdata)
         try:
             room = client.get_room(self.room_id)
+            if safe_int(room.get("live_status")) != 1:
+                raise ProtocolError("该 B 站直播间当前未开播")
             danmaku = client.get_danmaku_info(room["room_id"])
             self.buvid3 = client.buvid3
             with self.lock:
