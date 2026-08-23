@@ -119,8 +119,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if projectRoot == nil {
+            projectRoot = chooseProjectRoot()
+        }
         guard let root = projectRoot else {
-            setStatus("找不到项目目录。请从 bullet-screen 项目内运行此 App。", error: true)
+            setStatus("尚未选择有效的 bullet-screen 项目目录。请再次点击启动后选择。", error: true)
             return
         }
 
@@ -273,6 +276,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        return chooseProjectRoot()
+    }
+
+    private func chooseProjectRoot() -> URL? {
         let panel = NSOpenPanel()
         panel.title = "选择 bullet-screen 项目目录"
         panel.message = "请选择包含 bilibili 和 douyin 子目录的 bullet-screen 文件夹。"
@@ -304,8 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func isProjectRoot(_ url: URL) -> Bool {
         let manager = FileManager.default
-        return manager.fileExists(atPath: url.appendingPathComponent(".agent-os.toml").path)
-            && manager.fileExists(atPath: url.appendingPathComponent("bilibili/server.py").path)
+        return manager.fileExists(atPath: url.appendingPathComponent("bilibili/server.py").path)
             && manager.fileExists(atPath: url.appendingPathComponent("douyin/server.py").path)
     }
 
