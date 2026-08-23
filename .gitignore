@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 **/data/*.sqlite3
 **/data/*.sqlite3-*
+**/data/*.lock
 credentials.local.json
 .DS_Store
 dist/
