@@ -956,7 +956,7 @@ def main() -> None:
         collector = Collector(EventStore(Path(args.db)))
     handler = type("BoundAppHandler", (AppHandler,), {"collector": collector})
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    print(f"Live Intelligence local service: http://127.0.0.1:{args.port}/")
+    print(f"Live Intelligence local service: http://127.0.0.1:{server.server_address[1]}/", flush=True)
     print(f"Provider: {args.provider} · mode: {args.mode}")
     print(f"SQLite: {Path(args.db).resolve()}")
     try:

@@ -8,6 +8,17 @@ bullet-screen/
 └── douyin/     # 抖音 Live Intelligence 看板、采集 Adapter 与分析链路
 ```
 
+## macOS 启动程序
+
+在 macOS 上可构建并双击统一启动程序：
+
+```bash
+./macos/build-app.sh
+open dist/BulletScreen.app
+```
+
+启动窗口中选择 `Bilibili` 或 `抖音`，程序会自动寻找可用端口、启动对应子项目服务并打开看板。抖音还可选择本地演示模式；真实采集仍需要本机已安装 Playwright/Chromium。若 macOS 没有识别签名，可在终端运行 `open dist/BulletScreen.app`，或在“系统设置 → 隐私与安全性”中允许打开。
+
 ## B 站看板
 
 ```bash

@@ -927,7 +927,7 @@ def main() -> None:
     collector = Collector(store)
     handler = type("BoundAppHandler", (AppHandler,), {"collector": collector})
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    print(f"BiliDanmaku local service: http://127.0.0.1:{args.port}/")
+    print(f"BiliDanmaku local service: http://127.0.0.1:{server.server_address[1]}/", flush=True)
     print(f"SQLite: {Path(args.db).resolve()}")
     try:
         server.serve_forever()
