@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BiliDanmaku local collector.
+"""Live Intelligence local collector service.
 
 The browser is intentionally only a dashboard. This process owns credentials,
 the Bilibili REST/WebSocket protocol, SQLite persistence, and the small local
@@ -27,6 +27,9 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from douyin_adapter import DouyinCollector, parse_room_input
+from live_intelligence import analyze_text, normalize_event
 
 
 ROOT = Path(__file__).resolve().parent
@@ -781,7 +784,11 @@ class Collector:
 
 
 class AppHandler(SimpleHTTPRequestHandler):
-    collector: Collector
+    collector: Any
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["directory"] = str(ROOT)
+        super().__init__(*args, **kwargs)
 
     def log_message(self, format_string: str, *args: Any) -> None:
         if self.path.startswith("/api/"):
@@ -808,7 +815,7 @@ class AppHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/health":
-            self._send_json({"ok": True, "service": "bili-danmaku-local"})
+            self._send_json({"ok": True, "service": getattr(self.collector, "provider_name", "live-intelligence-local")})
             return
         if parsed.path == "/api/status":
             self._send_json(self.collector.status())
@@ -819,7 +826,11 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/events":
             query = urllib.parse.parse_qs(parsed.query)
             limit = min(max(safe_int((query.get("limit") or [100])[0], 100), 1), 500)
-            self._send_json({"events": self.collector.store.recent_events(self.collector.data_session_id(), limit)})
+            if hasattr(self.collector, "recent_events"):
+                events = self.collector.recent_events(limit)
+            else:
+                events = self.collector.store.recent_events(self.collector.data_session_id(), limit)
+            self._send_json({"events": events})
             return
         super().do_GET()
 
@@ -832,11 +843,17 @@ class AppHandler(SimpleHTTPRequestHandler):
             length = min(safe_int(self.headers.get("Content-Length"), 0), 128 * 1024)
             payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
             if parsed.path == "/api/connect":
-                room_id = str(payload.get("room_id") or "").strip()
-                if not room_id or not room_id.isdigit():
-                    self._send_json({"error": "room_id must be numeric"}, 400)
+                room_input = str(payload.get("url") or payload.get("room_id") or "").strip()
+                if not room_input:
+                    self._send_json({"error": "请提供抖音直播间 URL 或 room_id"}, 400)
                     return
-                self.collector.start(room_id, str(payload.get("sessdata") or ""))
+                if isinstance(self.collector, DouyinCollector):
+                    self.collector.start(room_input, str(payload.get("cookie") or payload.get("sessdata") or ""), str(payload.get("mode") or "") or None)
+                else:
+                    if not room_input.isdigit():
+                        self._send_json({"error": "B 站 room_id must be numeric"}, 400)
+                        return
+                    self.collector.start(room_input, str(payload.get("sessdata") or ""))
                 self._send_json(self.collector.status(), 202)
             else:
                 self.collector.stop()
@@ -907,23 +924,40 @@ def run_self_test() -> None:
         wrapped_interact = parse_business_event(json_bytes({"cmd": "INTERACT_WORD_V2", "data": {"pb": base64.b64encode(interact_proto).decode("ascii")}}))
         assert wrapped_interact and wrapped_interact["uid"] == 123 and wrapped_interact["uname"] == "name"
         store.close()
+    assert parse_room_input("https://live.douyin.com/123456")[0] == "123456"
+    assert analyze_text("这个多少钱，怎么买？")["purchase_intent"] == "high"
+    normalized = normalize_event("123456", "comment", "u1", "测试用户", "支持油皮吗？")
+    assert normalized["type"] == "comment" and normalized["analysis"]["topic"] == "product"
+    with tempfile.TemporaryDirectory() as temporary:
+        douyin = DouyinCollector(Path(temporary) / "douyin.sqlite3", mode="demo")
+        douyin.start("123456")
+        time.sleep(2.4)
+        demo_metrics = douyin.metrics()
+        assert demo_metrics["provider"] == "douyin" and demo_metrics["current"]["comments"] >= 1
+        assert demo_metrics["signals"] and douyin.recent_events(20)
+        douyin.stop()
     print("self-test: PASS (sqlite, packet codec, zlib recursion, DANMU_MSG parser)")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="BiliDanmaku local collector and dashboard server")
+    parser = argparse.ArgumentParser(description="Live Intelligence local collector and dashboard server")
     parser.add_argument("--port", type=int, default=4173)
     parser.add_argument("--db", default=str(DEFAULT_DB))
+    parser.add_argument("--provider", choices=("douyin", "bilibili"), default="douyin")
+    parser.add_argument("--mode", choices=("auto", "playwright", "demo"), default="auto", help="Douyin adapter mode")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         run_self_test()
         return
-    store = EventStore(Path(args.db))
-    collector = Collector(store)
+    if args.provider == "douyin":
+        collector = DouyinCollector(Path(args.db), mode=args.mode)
+    else:
+        collector = Collector(EventStore(Path(args.db)))
     handler = type("BoundAppHandler", (AppHandler,), {"collector": collector})
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    print(f"BiliDanmaku local service: http://127.0.0.1:{args.port}/")
+    print(f"Live Intelligence local service: http://127.0.0.1:{args.port}/")
+    print(f"Provider: {args.provider} · mode: {args.mode}")
     print(f"SQLite: {Path(args.db).resolve()}")
     try:
         server.serve_forever()
@@ -932,7 +966,7 @@ def main() -> None:
     finally:
         collector.stop()
         server.server_close()
-        store.close()
+        collector.store.close()
 
 
 if __name__ == "__main__":
