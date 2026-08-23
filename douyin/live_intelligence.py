@@ -179,7 +179,7 @@ def normalize_event(
 
 
 class LiveEventStore:
-    """SQLite store with provider-neutral tables; safe to share with the legacy B站 tables."""
+    """SQLite store for the Douyin subproject's normalized events and metrics."""
 
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,7 +208,6 @@ class LiveEventStore:
               room_id TEXT NOT NULL,
               event_type TEXT NOT NULL,
               event_time TEXT NOT NULL,
-              received_at TEXT NOT NULL,
               user_id TEXT,
               user_name TEXT,
               content TEXT,
@@ -261,12 +260,12 @@ class LiveEventStore:
         with self.lock:
             cursor = self.connection.execute(
                 """INSERT OR IGNORE INTO live_events(
-                event_id,session_id,provider,room_id,event_type,event_time,received_at,user_id,user_name,
+                event_id,session_id,provider,room_id,event_type,event_time,user_id,user_name,
                 content,metadata_json,topic,intent,sentiment,purchase_intent)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     event.get("event_id"), session_id, event.get("provider", "douyin"), event.get("room_id", ""),
-                    event.get("type", "unknown"), event.get("timestamp") or utc_now(), utc_now(),
+                    event.get("type", "unknown"), event.get("timestamp") or utc_now(),
                     event.get("user_id"), event.get("user_name"), event.get("content"),
                     json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), analysis.get("topic"),
                     analysis.get("intent"), analysis.get("sentiment"), analysis.get("purchase_intent"),

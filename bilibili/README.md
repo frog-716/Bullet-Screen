@@ -41,3 +41,5 @@ python3 server.py
 - `metric_snapshots`：在线人数、点赞、速率快照
 
 SQLite 文件被 `.gitignore` 排除，凭证不会进入仓库。
+
+当前 `events` 只保留看板和指标实际使用的字段：事件类型、时间、用户、文本、礼物、金额和在线人数；原始 JSON 包和重复接收时间不再写入。

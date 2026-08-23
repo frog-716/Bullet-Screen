@@ -13,10 +13,12 @@
 
 # State
 
-- 当前阶段：项目已统一更名为 `bullet-screen`，完成 B 站与抖音子项目归类，并完成原生 macOS 启动器；启动器可选择平台、自动寻找可用端口、拉起对应服务并打开看板。抖音 Live Intelligence MVP 已完成本地 demo/API 验收，并完成指定抖音房间的真实浏览器连接实测；B 站原有看板与 SQLite 数据已恢复到独立目录。
+- 当前阶段：项目已统一更名为 `bullet-screen`，完成 B 站与抖音子项目归类，并完成原生 macOS 启动器；启动器可选择平台、自动寻找可用端口、拉起对应服务并打开看板。抖音 Live Intelligence MVP 已完成本地 demo/API 验收，并在当前在线房间完成有效数据实测；B 站原有看板与 SQLite 数据已恢复到独立目录。
+- 已完成 SQLite 治理：B 站早期遗留的抖音 `live_*` 表已迁移到抖音库；删除 B 站事件未使用的 `received_at`、`raw_json`，删除抖音事件未使用的 `received_at`；迁移前备份已保存在临时目录。
+- macOS 启动器已支持 App 脱离项目目录后通过目录选择器重新绑定 `bullet-screen` 项目根目录。
 - 已有本地 HTTP/API 服务、信息密度优先的 Dashboard、`DouyinPublicAdapter`（Playwright/JSON/压缩二进制/DOM/demo）、统一事件模型、SQLite 事件与指标快照、窗口分析和运营信号。
-- `python3 server.py --self-test`、fixture-test、static-check、e2e-test 均已通过；已额外验证房间 `318653495382` 和 `50828500437` 的真实页面连接。后者页面可见且显示“需先登录，才能开始聊天”，但匿名采集 30 秒内未产生互动事件；`connected/online` 目前仅代表页面会话已打开。
-- 采集器支持 `PLAYWRIGHT_EXECUTABLE_PATH` 指定完整 Chromium，`brotli` 为可选解码能力；已修复未知压缩 WebSocket 帧中断监听的问题。下一步是获取合规登录态/真实互动样本后，统计当前轮询与私有协议的事件覆盖率，再评估直接 WebSocket/Protobuf adapter。
+- `python3 douyin/server.py --self-test`、DOM fixture-test、static-check、e2e-test 均已通过；房间 `119601611923` 修复后真实回归最近 60 秒得到约 3559 在线、35 条 comment、7 条 like、36 个活跃用户，累计缓冲还观察到 1 条 gift，指标已进入 Dashboard 数据链路。此前的 `318653495382` 已结束，`50828500437` 页面显示需登录且未产生互动。
+- 采集器支持首页 warm-up、`show_type` 安全保留、`PLAYWRIGHT_EXECUTABLE_PATH`/`DOUYIN_USER_AGENT` 配置、Brotli 和可选 stealth；已修复未知压缩帧、骨架页误连、DOM 选择器漏采集等问题。下一步是继续覆盖 gift/follow/share 事件，并评估直接 WebSocket/Protobuf adapter。
 
 # Sources
 
@@ -27,3 +29,4 @@
 - 抖音子项目：`douyin/README.md`、`douyin/server.py`、`douyin/douyin_adapter.py`、`douyin/live_intelligence.py`
 - 抖音技术探索、系统设计和阶段计划：`douyin/docs/douyin-exploration.md`
 - 抖音前端：`douyin/index.html`、`douyin/app.js`、`douyin/styles.css`
+- 数据库治理与迁移：`scripts/govern_databases.py`

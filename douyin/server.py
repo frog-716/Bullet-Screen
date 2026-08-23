@@ -416,9 +416,9 @@ class EventStore:
         );
         CREATE TABLE IF NOT EXISTS events(
           id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, event_type TEXT NOT NULL,
-          event_time TEXT NOT NULL, received_at TEXT NOT NULL, uid INTEGER, uname TEXT,
+          event_time TEXT NOT NULL, uid INTEGER, uname TEXT,
           text TEXT, gift_name TEXT, gift_num INTEGER, amount INTEGER, popularity INTEGER,
-          raw_json TEXT, FOREIGN KEY(session_id) REFERENCES sessions(id)
+          FOREIGN KEY(session_id) REFERENCES sessions(id)
         );
         CREATE TABLE IF NOT EXISTS metric_snapshots(
           id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, recorded_at TEXT NOT NULL,
@@ -444,8 +444,8 @@ class EventStore:
 
     def insert_event(self, session_id: int, event: Dict[str, Any]) -> None:
         with self.lock:
-            self.connection.execute("""INSERT INTO events(session_id,event_type,event_time,received_at,uid,uname,text,gift_name,gift_num,amount,popularity,raw_json)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (session_id, event.get("type", "unknown"), event.get("event_time") or utc_now(), utc_now(), event.get("uid"), event.get("uname"), event.get("text"), event.get("gift_name"), event.get("gift_num"), event.get("amount"), event.get("popularity"), json.dumps(event.get("raw"), ensure_ascii=False) if event.get("raw") is not None else None))
+            self.connection.execute("""INSERT INTO events(session_id,event_type,event_time,uid,uname,text,gift_name,gift_num,amount,popularity)
+              VALUES(?,?,?,?,?,?,?,?,?,?)""", (session_id, event.get("type", "unknown"), event.get("event_time") or utc_now(), event.get("uid"), event.get("uname"), event.get("text"), event.get("gift_name"), event.get("gift_num"), event.get("amount"), event.get("popularity")))
             self.connection.commit()
 
     def insert_snapshot(self, session_id: int, metrics: Dict[str, Any]) -> None:

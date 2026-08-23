@@ -15,8 +15,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var projectRoot: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        projectRoot = locateProjectRoot()
         buildWindow()
+        projectRoot = resolveProjectRoot()
+        if let projectRoot {
+            setStatus("已绑定项目：\(projectRoot.lastPathComponent)")
+        } else {
+            setStatus("请选择 bullet-screen 项目目录后再启动看板。", error: true)
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -250,19 +255,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLabel.textColor = error ? .systemRed : .secondaryLabelColor
     }
 
-    private func locateProjectRoot() -> URL? {
-        var candidate = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
-        for _ in 0..<10 {
-            let marker = candidate.appendingPathComponent(".agent-os.toml")
-            let bilibiliServer = candidate.appendingPathComponent("bilibili/server.py")
-            if FileManager.default.fileExists(atPath: marker.path) && FileManager.default.fileExists(atPath: bilibiliServer.path) {
-                return candidate
+    private func resolveProjectRoot() -> URL? {
+        var candidates: [URL] = []
+        if let configured = ProcessInfo.processInfo.environment["BULLET_SCREEN_ROOT"], !configured.isEmpty {
+            candidates.append(URL(fileURLWithPath: configured))
+        }
+        if let stored = UserDefaults.standard.string(forKey: "projectRoot"), !stored.isEmpty {
+            candidates.append(URL(fileURLWithPath: stored))
+        }
+        candidates.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+        candidates.append(URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent())
+
+        for candidate in candidates {
+            if let root = searchProjectAncestors(from: candidate) {
+                rememberProjectRoot(root)
+                return root
             }
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = "选择 bullet-screen 项目目录"
+        panel.message = "请选择包含 bilibili 和 douyin 子目录的 bullet-screen 文件夹。"
+        panel.prompt = "选择项目"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let selected = panel.url,
+              let root = searchProjectAncestors(from: selected) else {
+            return nil
+        }
+        rememberProjectRoot(root)
+        return root
+    }
+
+    private func searchProjectAncestors(from url: URL) -> URL? {
+        var candidate = url.resolvingSymlinksInPath().standardizedFileURL
+        if !FileManager.default.fileExists(atPath: candidate.path, isDirectory: nil) {
+            candidate.deleteLastPathComponent()
+        }
+        for _ in 0..<12 {
+            if isProjectRoot(candidate) { return candidate }
             let parent = candidate.deletingLastPathComponent()
             if parent.path == candidate.path { break }
             candidate = parent
         }
         return nil
+    }
+
+    private func isProjectRoot(_ url: URL) -> Bool {
+        let manager = FileManager.default
+        return manager.fileExists(atPath: url.appendingPathComponent(".agent-os.toml").path)
+            && manager.fileExists(atPath: url.appendingPathComponent("bilibili/server.py").path)
+            && manager.fileExists(atPath: url.appendingPathComponent("douyin/server.py").path)
+    }
+
+    private func rememberProjectRoot(_ url: URL) {
+        UserDefaults.standard.set(url.standardizedFileURL.path, forKey: "projectRoot")
     }
 
     private func findPython(in root: URL) -> URL? {
