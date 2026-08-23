@@ -8,6 +8,7 @@ HTTP API consumed by the dashboard.
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import http.cookiejar
 import json
@@ -59,6 +60,18 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 class ProtocolError(RuntimeError):
     pass
+
+
+def acquire_database_lock(path: Path) -> Any:
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise ProtocolError("该数据文件已有 Bilibili 服务在使用，请先关闭旧看板服务") from error
+    return handle
 
 
 class WbiSigner:
@@ -450,20 +463,14 @@ class EventStore:
             self.connection.execute("INSERT INTO metric_snapshots(session_id,recorded_at,online,likes,danmaku_rate,total_danmaku) VALUES(?,?,?,?,?,?)", (session_id, utc_now(), metrics.get("online", 0), metrics.get("likes", 0), metrics.get("rate", 0), metrics.get("total", 0)))
             self.connection.commit()
 
-    def recent_events(self, session_id: Optional[int], limit: int = 100) -> List[Dict[str, Any]]:
+    def recent_events(self, session_id: int, limit: int = 100) -> List[Dict[str, Any]]:
         with self.lock:
-            if session_id:
-                rows = self.connection.execute("SELECT event_time,event_type,uid,uname,text,gift_name,gift_num,amount,popularity FROM events WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit)).fetchall()
-            else:
-                rows = self.connection.execute("SELECT event_time,event_type,uid,uname,text,gift_name,gift_num,amount,popularity FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = self.connection.execute("SELECT event_time,event_type,uid,uname,text,gift_name,gift_num,amount,popularity FROM events WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit)).fetchall()
         return [dict(row) for row in reversed(rows)]
 
-    def recent_snapshots(self, session_id: Optional[int], limit: int = 60) -> List[Dict[str, Any]]:
+    def recent_snapshots(self, session_id: int, limit: int = 60) -> List[Dict[str, Any]]:
         with self.lock:
-            if session_id:
-                rows = self.connection.execute("SELECT recorded_at,online,likes,danmaku_rate,total_danmaku FROM metric_snapshots WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit)).fetchall()
-            else:
-                rows = self.connection.execute("SELECT recorded_at,online,likes,danmaku_rate,total_danmaku FROM metric_snapshots ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = self.connection.execute("SELECT recorded_at,online,likes,danmaku_rate,total_danmaku FROM metric_snapshots WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit)).fetchall()
         return [dict(row) for row in reversed(rows)]
 
     def close(self) -> None:
@@ -577,7 +584,6 @@ class Collector:
         self.thread: Optional[threading.Thread] = None
         self.socket: Optional[WebSocketClient] = None
         self.session_id: Optional[int] = None
-        self.last_session_id: Optional[int] = None
         self.room_id = ""
         self.room_title = ""
         self.status_name = "idle"
@@ -598,7 +604,6 @@ class Collector:
         with self.lock:
             self.room_id, self.sessdata, self.last_error = str(room_id).strip(), sessdata.strip(), ""
             self.room_title = ""
-            self.last_session_id = None
             self.online = 0
             self.online_event_seen = False
             self.likes = 0
@@ -625,26 +630,26 @@ class Collector:
             self.store.end_session(session_id)
         with self.lock:
             if session_id:
-                self.last_session_id = session_id
                 self.last_error = ""
             self.thread = None
             self.session_id = None
             self.status_name = "idle"
 
-    def data_session_id(self) -> Optional[int]:
+    def live_session_id(self) -> Optional[int]:
         with self.lock:
-            return self.session_id or self.last_session_id
+            return self.session_id if self.status_name == "connected" else None
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
-            return {"available": True, "connected": self.status_name == "connected", "status": self.status_name, "room_id": self.room_id, "room_title": self.room_title, "session_id": self.session_id, "online": self.online, "likes": self.likes, "total": self.total, "rate": self._rate(), "last_error": self.last_error, "diagnostics": self.diagnostics}
+            connected = self.status_name == "connected" and self.session_id is not None
+            return {"available": True, "connected": connected, "status": self.status_name, "data_source": "bilibili_websocket" if connected else "none", "room_id": self.room_id, "room_title": self.room_title, "session_id": self.session_id if connected else None, "online": self.online if connected else 0, "likes": self.likes if connected else 0, "total": self.total if connected else 0, "rate": self._rate() if connected else 0, "last_error": self.last_error, "diagnostics": self.diagnostics}
 
     def metrics(self) -> Dict[str, Any]:
         with self.lock:
             ranking: Dict[str, int] = {}
             keywords: Dict[str, int] = {}
             revenue = 0.0
-            session_id = self.session_id or self.last_session_id
+            session_id = self.session_id if self.status_name == "connected" else None
             if session_id:
                 rows = self.store.recent_events(session_id, 500)
                 for row in rows:
@@ -657,7 +662,7 @@ class Collector:
                         revenue += safe_int(row.get("amount")) / 1000
                     elif row.get("event_type") == "sc":
                         revenue += safe_int(row.get("amount"))
-            trend = self.store.recent_snapshots(session_id, 60)
+            trend = self.store.recent_snapshots(session_id, 60) if session_id else []
             current = self.status()
             if current["connected"]:
                 trend.append({"recorded_at": utc_now(), "online": current["online"], "likes": current["likes"], "danmaku_rate": current["rate"], "total_danmaku": current["total"]})
@@ -689,7 +694,7 @@ class Collector:
                     ws.connect()
                     with self.lock:
                         self.socket = ws
-                        self.status_name = "connected"
+                        self.status_name = "authenticating"
                     ws.send_binary(PacketCodec.auth(self.room_id, danmaku["token"], uid=client.uid, buvid3=self.buvid3))
                     self._receive_loop(ws)
                     return
@@ -713,8 +718,6 @@ class Collector:
                 if self.status_name == "connected":
                     self.status_name = "stopped"
                 self.session_id = None
-                if current_session:
-                    self.last_session_id = current_session
             if current_session:
                 self.store.end_session(current_session, "error" if self.last_error else "stopped")
 
@@ -744,6 +747,9 @@ class Collector:
                         raise ProtocolError(f"Bilibili WebSocket authentication failed: {auth_result.get('message') or auth_result.get('code')}")
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     pass
+                with self.lock:
+                    if self.status_name == "authenticating":
+                        self.status_name = "connected"
                 continue
             if operation == 3 and len(body) >= 4:
                 with self.lock:
@@ -767,8 +773,9 @@ class Collector:
                     self.likes += 1
             elif event_type not in ("unknown", None):
                 with self.lock:
-                    self.total += 1 if event_type in ("danmaku", "gift", "sc") else 0
-                    self.minute_events.append(time.time())
+                    if event_type == "danmaku":
+                        self.total += 1
+                        self.minute_events.append(time.time())
                 self.store.insert_event(session_id, event)
             if time.time() - self.last_snapshot >= 30:
                 self.store.insert_snapshot(session_id, self.status())
@@ -823,7 +830,11 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/events":
             query = urllib.parse.parse_qs(parsed.query)
             limit = min(max(safe_int((query.get("limit") or [100])[0], 100), 1), 500)
-            self._send_json({"events": self.collector.store.recent_events(self.collector.data_session_id(), limit)})
+            session_id = self.collector.live_session_id()
+            events = self.collector.store.recent_events(session_id, limit) if session_id else []
+            if session_id != self.collector.live_session_id():
+                session_id, events = None, []
+            self._send_json({"events": events, "session_id": session_id, "data_source": "bilibili_websocket" if session_id else "none"})
             return
         super().do_GET()
 
@@ -889,15 +900,21 @@ def run_self_test() -> None:
         assert parse_business_event(json_bytes({"cmd": "DANMU_MSG", "info": [None, "hi", [12, "name"]]}))["uname"] == "name"
         collector = Collector(store)
         collector.session_id = session
+        collector.status_name = "connected"
         danmaku_packet = PacketCodec.pack(json_bytes({"cmd": "DANMU_MSG", "info": [None, "through collector", [12, "name"]]}), 5, 1)
         collector._handle_packet(PacketCodec.pack(__import__("zlib").compress(danmaku_packet), 5, 2))
         assert len(store.recent_events(session, 10)) == 2 and len(store.recent_snapshots(session, 10)) == 1
         online_packet = PacketCodec.pack(struct.pack(">I", 999999), 3, 1) + PacketCodec.pack(json_bytes({"cmd": "WATCHED_CHANGE", "data": {"num": 7}}), 5, 1)
         collector._handle_packet(online_packet)
         assert collector.online == 7 and collector.online_event_seen
+        assert collector.live_session_id() == session and ("name", 1) in collector.metrics()["ranking"]
         collector.session_id = None
-        collector.last_session_id = session
-        assert ("name", 1) in collector.metrics()["ranking"]
+        collector.status_name = "idle"
+        assert collector.live_session_id() is None and collector.metrics()["ranking"] == []
+        collector.session_id = session
+        collector.status_name = "authenticating"
+        collector._handle_packet(PacketCodec.pack(json_bytes({"code": 0}), 8, 1))
+        assert collector.status_name == "connected" and collector.live_session_id() == session
         def varint(value: int) -> bytes:
             output = bytearray()
             while value > 127:
@@ -923,20 +940,29 @@ def main() -> None:
     if args.self_test:
         run_self_test()
         return
-    store = EventStore(Path(args.db))
-    collector = Collector(store)
-    handler = type("BoundAppHandler", (AppHandler,), {"collector": collector})
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    print(f"BiliDanmaku local service: http://127.0.0.1:{server.server_address[1]}/", flush=True)
-    print(f"SQLite: {Path(args.db).resolve()}")
+    db_path = Path(args.db).resolve()
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        database_lock = acquire_database_lock(db_path)
+    except ProtocolError as error:
+        raise SystemExit(str(error))
+    try:
+        store = EventStore(db_path)
+        collector = Collector(store)
+        handler = type("BoundAppHandler", (AppHandler,), {"collector": collector})
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
+        print(f"BiliDanmaku local service: http://127.0.0.1:{server.server_address[1]}/", flush=True)
+        print(f"SQLite: {db_path}")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            collector.stop()
+            server.server_close()
+            store.close()
     finally:
-        collector.stop()
-        server.server_close()
-        store.close()
+        fcntl.flock(database_lock.fileno(), fcntl.LOCK_UN)
+        database_lock.close()
 
 
 if __name__ == "__main__":

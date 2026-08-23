@@ -26,11 +26,13 @@ python3 server.py
 3. `getDanmuInfo` 成功后取得 token 和 WebSocket host 列表。
 4. 建立 WebSocket，发送 op=7 认证包，并每 30 秒发送 op=2 心跳。
 5. 解析 16 字节大端包头；默认使用 protover=2 的 zlib 兼容链路；安装可选的 `brotli` Python 包后自动使用并解析 protover=3。
-6. 解析 `DANMU_MSG`、`SEND_GIFT`、`SUPER_CHAT_MESSAGE`、`INTERACT_WORD`、`INTERACT_WORD_V2`（最小 protobuf 字段解析）、在线人数和点赞事件。
+6. 解析 `DANMU_MSG`、`SEND_GIFT`、`SUPER_CHAT_MESSAGE`、`INTERACT_WORD`、`INTERACT_WORD_V2`（最小 protobuf 字段解析）、B 站热度值和点赞事件。
 7. 写入 `data/danmaku.sqlite3`，看板通过本地 API 每 2 秒同步。
 
 `-352` 是 B 站风控响应，不会被降级伪装成“已连接”。
 `/api/status` 会返回不含凭证的诊断信息：是否拿到 `buvid3/buvid4`、是否提交了 SESSDATA、直连/WBI 各自的返回码；不会返回 Cookie、token 或原始请求头。
+
+看板只接受同时满足以下条件的数据：后端状态为已连接、事件属于当前 `session_id`、来源为 `bilibili_websocket`。未连接、连接失败或断开后，实时看板保持空白，不会回退显示 SQLite 历史记录。事件时间按浏览器本地时区显示。一个 SQLite 文件同一时间只允许一个 Bilibili 服务写入。
 
 ## SQLite
 
@@ -38,8 +40,8 @@ python3 server.py
 
 - `sessions`：直播场次
 - `events`：原始业务事件
-- `metric_snapshots`：在线人数、点赞、速率快照
+- `metric_snapshots`：B 站热度值、点赞事件和弹幕速率快照
 
 SQLite 文件被 `.gitignore` 排除，凭证不会进入仓库。
 
-当前 `events` 只保留看板和指标实际使用的字段：事件类型、时间、用户、文本、礼物、金额和在线人数；原始 JSON 包和重复接收时间不再写入。
+当前 `events` 只保留看板和指标实际使用的字段：事件类型、时间、用户、文本、礼物、金额和 B 站热度值；原始 JSON 包和重复接收时间不再写入。
