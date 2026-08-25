@@ -212,7 +212,7 @@ def drop_legacy_tables(connection: sqlite3.Connection) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Govern bullet-screen SQLite databases")
+    parser = argparse.ArgumentParser(description="Govern Bullet-Screen SQLite databases")
     parser.add_argument("--bilibili", type=Path, default=DEFAULT_BILIBILI_DB)
     parser.add_argument("--douyin", type=Path, default=DEFAULT_DOUYIN_DB)
     parser.add_argument("--backup-dir", type=Path, default=None)
@@ -224,7 +224,7 @@ def main() -> None:
     try:
         backup_dir = None
         if args.apply:
-            backup_dir = args.backup_dir or Path(tempfile.mkdtemp(prefix="bullet-screen-db-backup-"))
+            backup_dir = args.backup_dir or Path(tempfile.mkdtemp(prefix="Bullet-Screen-db-backup-"))
             backup(bilibili, backup_dir / "bilibili.sqlite3")
             backup(douyin, backup_dir / "douyin.sqlite3")
             print(f"backup: {backup_dir}")

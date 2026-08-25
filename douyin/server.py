@@ -28,7 +28,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from douyin_adapter import DouyinCollector, parse_room_input
+from douyin_adapter import DouyinCollector, _decode_im_event, _decode_im_response, parse_room_input
 from live_intelligence import analyze_text, normalize_event
 
 
@@ -795,6 +795,13 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
         super().log_message(format_string, *args)
 
+    def end_headers(self) -> None:
+        if not self.path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        super().end_headers()
+
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -928,6 +935,21 @@ def run_self_test() -> None:
     assert analyze_text("这个多少钱，怎么买？")["purchase_intent"] == "high"
     normalized = normalize_event("123456", "comment", "u1", "测试用户", "支持油皮吗？")
     assert normalized["type"] == "comment" and normalized["analysis"]["topic"] == "product"
+    def proto_field(number: int, value: Any, wire_type: int = 2) -> bytes:
+        if wire_type == 0:
+            return varint(number << 3) + varint(int(value))
+        encoded = bytes(value)
+        return varint((number << 3) | 2) + varint(len(encoded)) + encoded
+    proto_user = proto_field(1, 7, 0) + proto_field(3, "协议用户".encode("utf-8"))
+    proto_common = proto_field(4, 1787510000000, 0)
+    proto_chat = proto_field(1, proto_common) + proto_field(2, proto_user) + proto_field(3, "真实评论".encode("utf-8"))
+    proto_envelope = proto_field(1, b"WebcastChatMessage") + proto_field(2, proto_chat) + proto_field(3, 99, 0)
+    proto_response = proto_field(1, proto_envelope) + proto_field(4, 1787510000123, 0)
+    decoded_response = _decode_im_response(proto_response)
+    decoded_event = _decode_im_event(decoded_response["messages"][0], decoded_response["now"])
+    assert decoded_event and decoded_event["type"] == "comment"
+    assert decoded_event["user_name"] == "协议用户" and decoded_event["content"] == "真实评论"
+    assert decoded_event["metadata"]["event_id"] == "99" and decoded_event["metadata"]["source"] == "fetch_protobuf"
     with tempfile.TemporaryDirectory() as temporary:
         douyin = DouyinCollector(Path(temporary) / "douyin.sqlite3", mode="demo")
         douyin.start("123456")
@@ -936,7 +958,7 @@ def run_self_test() -> None:
         assert demo_metrics["provider"] == "douyin" and demo_metrics["current"]["comments"] >= 1
         assert demo_metrics["signals"] and douyin.recent_events(20)
         douyin.stop()
-    print("self-test: PASS (sqlite, packet codec, zlib recursion, DANMU_MSG parser)")
+    print("self-test: PASS (sqlite, Bilibili codec, Douyin fetch protobuf, event analysis)")
 
 
 def main() -> None:
@@ -951,14 +973,15 @@ def main() -> None:
         run_self_test()
         return
     if args.provider == "douyin":
-        collector = DouyinCollector(Path(args.db), mode=args.mode)
+        db_path = Path(":memory:") if args.mode == "demo" else Path(args.db)
+        collector = DouyinCollector(db_path, mode=args.mode)
     else:
         collector = Collector(EventStore(Path(args.db)))
     handler = type("BoundAppHandler", (AppHandler,), {"collector": collector})
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"Live Intelligence local service: http://127.0.0.1:{server.server_address[1]}/", flush=True)
     print(f"Provider: {args.provider} · mode: {args.mode}")
-    print(f"SQLite: {Path(args.db).resolve()}")
+    print(f"SQLite: {'memory only' if args.provider == 'douyin' and args.mode == 'demo' else Path(args.db).resolve()}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-APP_DIR="$PROJECT_ROOT/dist/BulletScreen.app"
+APP_DIR="$PROJECT_ROOT/dist/Bullet-Screen.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 
 rm -rf "$APP_DIR"

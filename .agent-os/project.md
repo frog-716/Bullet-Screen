@@ -13,14 +13,16 @@
 
 # State
 
-- 当前阶段：项目已统一更名为 `bullet-screen`，完成 B 站与抖音子项目归类，并完成原生 macOS 启动器；启动器可选择平台、自动寻找可用端口、拉起对应服务并打开看板。抖音 Live Intelligence MVP 已完成本地 demo/API 验收，并在当前在线房间完成有效数据实测；B 站原有看板与 SQLite 数据已恢复到独立目录。
+- 当前阶段：项目已统一更名为 `Bullet-Screen`，完成 B 站与抖音子项目归类，并完成原生 macOS 启动器；启动器可选择平台、自动寻找可用端口、拉起对应服务并打开看板。抖音 Live Intelligence MVP 已接入公开页面 `/webcast/im/fetch/` protobuf 长轮询并完成登录态协议级验收；它能证明收到页面实际事件，但不宣称是官方完整总量。B 站原有看板与 SQLite 数据已恢复到独立目录。
 - 已完成 SQLite 治理：B 站早期遗留的抖音 `live_*` 表已迁移到抖音库；删除 B 站事件未使用的 `received_at`、`raw_json`，删除抖音事件未使用的 `received_at`；迁移前备份已保存在临时目录。
-- macOS 启动器已支持 App 脱离项目目录后通过目录选择器重新绑定 `bullet-screen` 项目根目录。
+- macOS 启动器已支持 App 脱离项目目录后通过目录选择器重新绑定 `Bullet-Screen` 项目根目录。
 - B 站旧会话数据已按用户授权清空；抖音明确标记 `source=demo` 的演示会话已删除。B 站 API 与前端现在只展示当前已连接 `session_id` 且来源为 `bilibili_websocket` 的数据，断开时返回空数据，并用文件锁阻止多个服务同时写同一 SQLite；该 B 站版本已由用户完成登录态真实连接测试并确认通过。
 - B 站连接已修复目标房间被旧后端状态覆盖的问题，目标短号与解析后的活动房间分开维护；短号 `7777` 已真实解析到房间 `545068` 并通过 WebSocket 事件回归。HTTP GET 增加瞬时网络重试，未开播房间会明确报错。
-- 已有本地 HTTP/API 服务、信息密度优先的 Dashboard、`DouyinPublicAdapter`（Playwright/JSON/压缩二进制/DOM/demo）、统一事件模型、SQLite 事件与指标快照、窗口分析和运营信号。
-- `python3 douyin/server.py --self-test`、DOM fixture-test、static-check、e2e-test 均已通过；房间 `119601611923` 修复后真实回归最近 60 秒得到约 3559 在线、35 条 comment、7 条 like、36 个活跃用户，累计缓冲还观察到 1 条 gift，指标已进入 Dashboard 数据链路。此前的 `318653495382` 已结束，`50828500437` 页面显示需登录且未产生互动。
-- 采集器支持首页 warm-up、`show_type` 安全保留、`PLAYWRIGHT_EXECUTABLE_PATH`/`DOUYIN_USER_AGENT` 配置、Brotli 和可选 stealth；已修复未知压缩帧、骨架页误连、DOM 选择器漏采集等问题。下一步是继续覆盖 gift/follow/share 事件，并评估直接 WebSocket/Protobuf adapter。
+- 已有本地 HTTP/API 服务、信息密度优先的 Dashboard、`DouyinPublicAdapter`（Playwright fetch protobuf/JSON/WebSocket 兼容/DOM 降级/demo）、统一事件模型、SQLite 事件与指标快照、窗口分析和运营信号。
+- 2026-08-24 已按用户要求清空抖音库全部历史测试数据：`live_sessions=0`、`live_events=0`、`live_metric_snapshots=0`。此前房间 `119601611923` 的 DOM 记录不再作为真实验收证据；`318653495382`、`50828500437` 也不保留测试会话。
+- 用户已于 2026-08-24 在项目专用 Chromium Profile 完成登录。随后对抗审查发现旧 DOM 实现把“来了”进场提示误算为评论、回填首屏历史消息、把页面点赞提示误称为总点赞，并在断开后继续展示旧会话；受影响的 3 个会话已全部清空。
+- 2026-08-24 对房间 `174657918755` 从空库做最终协议验收：32 条事件中有 28 条 `fetch_protobuf` 互动（comment=3、entry=20、gift=2、like=1、viewer_change=2），平台 msg_id 全部唯一；评论/礼物/进场/点赞无 DOM 混入，并有 2 条协议评论与页面用户名+正文精确匹配。API 北京时间 `+08:00` 与保留的 UTC 表示同一时刻，静态资源禁止缓存。
+- 显式 `demo` 服务使用内存数据库，真实服务拒绝切换到 `demo`，防止演示事件再次混入真实 SQLite。Dashboard 明确使用评论事件、点赞批次、礼物事件和协议在线人数口径；协议事件均标记 `complete=false`，后续只有官方能力才能给出平台总量语义。当前本机 headless 页面会停止持续请求，真实采集需维持可见 Chromium；Profile 可复用且当前约 126 MB，断开后浏览器自动关闭。
 
 # Sources
 

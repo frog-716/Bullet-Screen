@@ -20,7 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let projectRoot {
             setStatus("已绑定项目：\(projectRoot.lastPathComponent)")
         } else {
-            setStatus("请选择 bullet-screen 项目目录后再启动看板。", error: true)
+            setStatus("请选择 Bullet-Screen 项目目录后再启动看板。", error: true)
         }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered,
                           defer: false)
-        window.title = "bullet-screen"
+        window.title = "Bullet-Screen"
         window.isReleasedWhenClosed = false
         window.contentView = content
         window.center()
@@ -51,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let title = NSTextField(labelWithString: "直播弹幕看板")
         title.font = NSFont.systemFont(ofSize: 30, weight: .bold)
 
-        let subtitle = NSTextField(wrappingLabelWithString: "选择平台后，bullet-screen 会启动对应的本地采集服务，并打开看板页面。")
+        let subtitle = NSTextField(wrappingLabelWithString: "选择平台后，Bullet-Screen 会启动对应的本地采集服务，并打开看板页面。")
         subtitle.textColor = .secondaryLabelColor
         subtitle.font = NSFont.systemFont(ofSize: 14)
 
@@ -123,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             projectRoot = chooseProjectRoot()
         }
         guard let root = projectRoot else {
-            setStatus("尚未选择有效的 bullet-screen 项目目录。请再次点击启动后选择。", error: true)
+            setStatus("尚未选择有效的 Bullet-Screen 项目目录。请再次点击启动后选择。", error: true)
             return
         }
 
@@ -281,8 +281,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func chooseProjectRoot() -> URL? {
         let panel = NSOpenPanel()
-        panel.title = "选择 bullet-screen 项目目录"
-        panel.message = "请选择包含 bilibili 和 douyin 子目录的 bullet-screen 文件夹。"
+        panel.title = "选择 Bullet-Screen 项目目录"
+        panel.message = "请选择包含 bilibili 和 douyin 子目录的 Bullet-Screen 文件夹。"
         panel.prompt = "选择项目"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true

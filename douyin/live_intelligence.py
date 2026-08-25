@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -50,9 +50,26 @@ STOP_WORDS = {
     "现在", "已经", "还是", "怎么", "什么", "支持", "一下子", "大家", "帮忙", "看看",
 }
 
+CHINA_TIMEZONE = timezone(timedelta(hours=8))
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def china_timestamp(value: Any) -> str:
+    """Render stored UTC timestamps explicitly in the dashboard's China timezone."""
+
+    text = str(value or "")
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(CHINA_TIMEZONE).isoformat(timespec="milliseconds")
+    except ValueError:
+        return text
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -291,14 +308,16 @@ class LiveEventStore:
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
-        timestamp = str(row["event_time"])
+        timestamp_utc = str(row["event_time"])
+        timestamp = china_timestamp(timestamp_utc)
         try:
             metadata = json.loads(row["metadata_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
             metadata = {}
         return {
             "event_id": row["event_id"], "provider": row["provider"], "room_id": row["room_id"],
-            "timestamp": timestamp, "event_time": timestamp, "type": row["event_type"], "event_type": row["event_type"],
+            "timestamp": timestamp, "event_time": timestamp, "timestamp_utc": timestamp_utc,
+            "type": row["event_type"], "event_type": row["event_type"],
             "user": {"id": row["user_id"] or "", "name": row["user_name"] or "匿名用户"},
             "user_id": row["user_id"] or "", "user_name": row["user_name"] or "匿名用户",
             "content": row["content"] or "", "text": row["content"] or "", "metadata": metadata,
@@ -334,7 +353,14 @@ class LiveEventStore:
                     "SELECT recorded_at,online,comment_rate,like_rate,gift_rate,active_users,heat_score,purchase_ratio,positive_ratio,negative_ratio FROM live_metric_snapshots ORDER BY id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        result = []
+        for row in reversed(rows):
+            item = dict(row)
+            recorded_at_utc = str(item.get("recorded_at") or "")
+            item["recorded_at_utc"] = recorded_at_utc
+            item["recorded_at"] = china_timestamp(recorded_at_utc)
+            result.append(item)
+        return result
 
     def close(self) -> None:
         with self.lock:
@@ -368,7 +394,12 @@ class SignalEngine:
             gifts = sum(1 for event in window if event.get("type") == "gift")
             follows = sum(1 for event in window if event.get("type") == "follow")
             shares = sum(1 for event in window if event.get("type") == "share")
-            users = {str(event.get("user_id") or event.get("user_name") or "") for event in window if event.get("type") != "viewer_change"}
+            interaction_types = {"comment", "like", "gift", "follow", "share"}
+            users = {
+                str(event.get("user_id") or event.get("user_name") or "")
+                for event in window
+                if event.get("type") in interaction_types
+            }
             high_purchase = sum(1 for event in comments if event.get("purchase_intent") == "high")
             medium_purchase = sum(1 for event in comments if event.get("purchase_intent") == "medium")
             positive = sum(1 for event in comments if event.get("sentiment") == "positive")
