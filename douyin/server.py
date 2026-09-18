@@ -12,7 +12,6 @@ import hashlib
 import http.cookiejar
 import json
 import os
-import random
 import re
 import socket
 import sqlite3
