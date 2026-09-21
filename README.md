@@ -43,10 +43,20 @@ python3 server.py --mode demo
 
 ## 数据边界
 
-本地 SQLite 位于各子项目自己的 `data/` 目录，并被 Git 忽略。Cookie 等凭证只在对应本地服务进程内存中使用，不写入数据库、日志或仓库。
+本地 SQLite 位于各子项目自己的 `data/` 目录，并被 Git 忽略。Bilibili 页面输入的 Cookie 和 Douyin 页面手工输入的 Cookie 只在对应本地服务进程内存中使用，不写入数据库、日志或仓库。
+
+Douyin 真实浏览器模式默认使用 `douyin/data/browser-profile/` 持久 Profile；该目录可能保存浏览器登录态和 Cookie。它不是“仅内存凭证”，关闭采集不会自动删除登录态。`--mode demo` 使用内存 SQLite，退出后清空；真实数据库和 Profile 都是本机运行数据，不应当当作静态网页资源或临时缓存处理。
+
+本地页面通过同源 `/api/bootstrap` 获取本次服务启动生成的浏览器调用边界令牌，并只在页面内存中通过 `X-Bullet-Screen-Token` 调用敏感 API；令牌不放入 URL、localStorage、SQLite 或日志。它用于同源/跨站请求边界和 CSRF 类防护，不是防御同机恶意程序的认证系统。`/api/health` 可用于无令牌健康检查。
 
 ## 数据库治理
 
-当前数据库只保留看板实际读取的字段：B 站事件移除了未使用的 `received_at`、`raw_json`；抖音事件移除了未使用的 `received_at`。早期误写入 B 站库的 `live_*` 抖音表已迁移到 `douyin/data/danmaku.sqlite3`，再从 B 站库删除。迁移脚本位于 [`scripts/govern_databases.py`](scripts/govern_databases.py)，后续 schema 变更必须先备份并通过该脚本验证。
+当前服务支持的数据库 schema version 是 `3`。本机现有数据库可能仍处于 v2。打开已有数据库时会同时检查版本和 schema signature（表、列属性、索引、唯一约束与 foreign key）；版本过旧、未知、更新或结构损坏都会拒绝继续写入。空数据库和 `--mode demo` 仍可创建内存/新数据库。已有 v2 数据库不能被 v3 服务直接写入，也不会被服务偷偷升级；迁移必须显式执行。
+
+迁移脚本位于 [`scripts/govern_databases.py`](scripts/govern_databases.py)，正式流程是锁定、复制 SQLite/WAL/SHM、只在隔离副本上验证和迁移、验证 candidate、持久化状态后切换，并保留原数据库用于恢复。本 checkpoint 没有对真实 v2 数据库执行 migration；任何真实操作前都必须先使用隔离副本完成演练。
+
+coverage API 区分四种状态：`reliable_with_data`（窗口完整且有事件）、`reliable_no_events`（有可靠采集证据但窗口内无事件）、`gap`（窗口与采集缺口重叠）和 `unknown`（没有足够证据判断完整性）。`unknown/null` 不等于数字 `0`；礼物数量、平台原始金额、币种和估算收入分别保留，不能互相替代。
+
+当前数据库只保留看板实际读取的字段：B 站事件移除了未使用的 `received_at`、`raw_json`；抖音事件移除了未使用的 `received_at`。早期误写入 B 站库的 `live_*` 抖音表已迁移到 `douyin/data/danmaku.sqlite3`，再从 B 站库删除。
 
 B 站实时看板不会读取断开前的 SQLite 会话；只有当前已连接 WebSocket 的 `session_id` 会进入页面。现有 B 站旧数据已清空；抖音错误历史会话和修正验证会话也都已清空，下一次用户对照确认从空库开始。

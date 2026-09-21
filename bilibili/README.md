@@ -17,7 +17,7 @@ python3 server.py
 
 然后打开 <http://127.0.0.1:4173/>。
 
-连接设置里的房间号和 Cookie 会发送到本机服务。Cookie 支持完整浏览器 Cookie 或单独的 SESSDATA，只在本地服务进程内存中使用，不写入 SQLite、日志或 Git；普通房间通常需要登录态。
+连接设置里的房间号和 Cookie 会发送到本机服务。Cookie 支持完整浏览器 Cookie 或单独的 SESSDATA，只在本地服务进程内存中使用，不写入 SQLite、日志或 Git；普通房间通常需要登录态。看板启动后从同源 `/api/bootstrap` 获取本次服务启动的浏览器调用边界令牌，敏感 API 通过内存中的 `X-Bullet-Screen-Token` 调用；该令牌用于同源/跨站请求和 CSRF 类防护，不是防御同机恶意程序的认证系统。不要把令牌放入 URL、日志或持久化文件。
 
 ## 真实协议链路
 

@@ -8,11 +8,15 @@ HTTP API consumed by the dashboard.
 
 import argparse
 import base64
+import fcntl
 import hashlib
+import hmac
 import http.cookiejar
 import json
+import mimetypes
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import ssl
@@ -22,17 +26,69 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from douyin_adapter import DouyinCollector, _decode_im_event, _decode_im_response, parse_room_input
+from douyin_adapter import BusyError, DouyinCollector, _decode_im_event, _decode_im_response, parse_room_input
 from live_intelligence import analyze_text, normalize_event
 
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "data" / "danmaku.sqlite3"
+STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/styles.css": "styles.css"}
+PUBLIC_API_PATHS = {"/api/health", "/api/bootstrap"}
+PROTECTED_API_PATHS = {"/api/status", "/api/metrics", "/api/events", "/api/connect", "/api/disconnect"}
+MAX_REQUEST_BYTES = 64 * 1024
+REQUEST_TIMEOUT_SECONDS = 10.0
+FRESHNESS_TIMEOUT_SECONDS = 45.0
+MAX_WS_FRAME_BYTES = 1 * 1024 * 1024
+MAX_WS_MESSAGE_BYTES = 4 * 1024 * 1024
+MAX_WS_HANDSHAKE_BYTES = 16 * 1024
+MAX_PACKET_BODY_BYTES = 4 * 1024 * 1024
+MAX_PACKET_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_PACKET_COUNT = 512
+MAX_PACKET_DEPTH = 4
+SCHEMA_VERSION = 3
+CORE_SCHEMA_TABLES = {"sessions", "events", "metric_snapshots", "capture_gaps"}
+LEGACY_SCHEMA_TABLES = {"live_sessions", "live_events", "live_metric_snapshots"}
+SCHEMA_COLUMNS = {
+    "sessions": {
+        "id": ("INTEGER", 0, 1, None), "room_id": ("TEXT", 1, 0, None),
+        "room_title": ("TEXT", 1, 0, None), "started_at": ("TEXT", 1, 0, None),
+        "ended_at": ("TEXT", 0, 0, None), "status": ("TEXT", 1, 0, "'running'"),
+    },
+    "events": {
+        "id": ("INTEGER", 0, 1, None), "session_id": ("INTEGER", 1, 0, None),
+        "event_type": ("TEXT", 1, 0, None), "event_time": ("TEXT", 1, 0, None),
+        "uid": ("INTEGER", 0, 0, None), "uname": ("TEXT", 0, 0, None),
+        "text": ("TEXT", 0, 0, None), "gift_name": ("TEXT", 0, 0, None),
+        "gift_num": ("INTEGER", 0, 0, None), "amount": ("INTEGER", 0, 0, None),
+        "popularity": ("INTEGER", 0, 0, None),
+    },
+    "metric_snapshots": {
+        "id": ("INTEGER", 0, 1, None), "session_id": ("INTEGER", 1, 0, None),
+        "recorded_at": ("TEXT", 1, 0, None), "online": ("INTEGER", 0, 0, "0"),
+        "likes": ("INTEGER", 0, 0, "0"), "danmaku_rate": ("REAL", 0, 0, "0"),
+        "total_danmaku": ("INTEGER", 0, 0, "0"),
+    },
+    "capture_gaps": {
+        "id": ("INTEGER", 0, 1, None), "provider": ("TEXT", 1, 0, None),
+        "room_id": ("TEXT", 1, 0, None), "session_id": ("INTEGER", 0, 0, None),
+        "run_id": ("TEXT", 0, 0, None), "gap_start": ("TEXT", 1, 0, None),
+        "gap_end": ("TEXT", 0, 0, None), "reason": ("TEXT", 1, 0, None),
+        "source": ("TEXT", 1, 0, "'collector'"), "status": ("TEXT", 1, 0, "'open'"),
+    },
+}
+SCHEMA_INDEXES = {
+    "idx_events_session_time": ("events", ("session_id", "event_time")),
+    "idx_events_type": ("events", ("session_id", "event_type")),
+    "idx_metrics_session_time": ("metric_snapshots", ("session_id", "recorded_at")),
+    "idx_capture_gaps_session_time": ("capture_gaps", ("session_id", "gap_start", "gap_end")),
+}
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"
 REFERER = "https://live.bilibili.com/"
 WBI_TABLE = [
@@ -48,6 +104,23 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def parse_utc_timestamp(value: Any) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def stale_gap_start(last_valid_at: str, freshness_seconds: float) -> str:
+    parsed = parse_utc_timestamp(last_valid_at)
+    if parsed is None:
+        return utc_now()
+    return (parsed + timedelta(seconds=freshness_seconds)).isoformat(timespec="milliseconds")
+
+
 def json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -59,8 +132,94 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class ProtocolError(RuntimeError):
     pass
+
+
+class SchemaVersionError(RuntimeError):
+    """The database is empty, unsupported, or requires an explicit migration."""
+
+
+def _schema_default(value: Any) -> Optional[str]:
+    return None if value is None else str(value).replace(" ", "").lower()
+
+
+def verify_schema_signature(connection: sqlite3.Connection) -> None:
+    tables = {
+        row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    missing_tables = CORE_SCHEMA_TABLES - tables
+    unexpected_tables = tables - CORE_SCHEMA_TABLES - LEGACY_SCHEMA_TABLES
+    if missing_tables or unexpected_tables:
+        raise SchemaVersionError(
+            f"Bilibili compatibility schema signature mismatch: missing={sorted(missing_tables)}, unexpected={sorted(unexpected_tables)}"
+        )
+    legacy_tables = tables & LEGACY_SCHEMA_TABLES
+    if legacy_tables and legacy_tables != LEGACY_SCHEMA_TABLES:
+        raise SchemaVersionError("Bilibili compatibility legacy schema is incomplete")
+    for table, required in SCHEMA_COLUMNS.items():
+        actual = {
+            row[1]: (str(row[2]).upper(), int(row[3]), int(row[5]), _schema_default(row[4]))
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for name, expected in required.items():
+            if name not in actual or actual[name] != expected:
+                raise SchemaVersionError(f"Bilibili compatibility schema mismatch in {table}.{name}")
+    for index_name, (table, expected_columns) in SCHEMA_INDEXES.items():
+        index_row = next(
+            (row for row in connection.execute(f"PRAGMA index_list({table})") if row[1] == index_name),
+            None,
+        )
+        if not index_row:
+            raise SchemaVersionError(f"Bilibili compatibility schema missing index {index_name}")
+        actual_columns = tuple(
+            row[2] for row in connection.execute(f"PRAGMA index_info({index_name})")
+        )
+        if actual_columns != expected_columns:
+            raise SchemaVersionError(f"Bilibili compatibility schema mismatch in index {index_name}")
+    expected_foreign_keys = {
+        "sessions": set(),
+        "events": {("sessions", "session_id", "id")},
+        "metric_snapshots": {("sessions", "session_id", "id")},
+        "capture_gaps": {("sessions", "session_id", "id")},
+    }
+    for table, expected in expected_foreign_keys.items():
+        actual = {(row[2], row[3], row[4]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")}
+        if actual != expected:
+            raise SchemaVersionError(f"Bilibili compatibility schema mismatch in foreign keys for {table}")
+
+
+@dataclass(frozen=True)
+class RunContext:
+    generation: int
+    run_id: str
+    provider: str
+    room_id: str
+    sessdata: str = field(repr=False)
+    cancel: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+
+
+def acquire_database_lock(path: Path) -> Any:
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise ProtocolError("该数据文件已有服务在使用，请先关闭旧看板服务") from error
+    return handle
 
 
 class WbiSigner:
@@ -265,66 +424,116 @@ class PacketCodec:
         return PacketCodec.pack(b"", 2, 1)
 
     @staticmethod
-    def decode(data: bytes, depth: int = 0) -> Iterable[Tuple[int, int, bytes]]:
-        if depth > 4:
+    def decode(data: bytes, depth: int = 0, _budget: Optional[Dict[str, int]] = None) -> Iterable[Tuple[int, int, bytes]]:
+        budget = _budget or {"bytes": 0, "packets": 0}
+        if depth > MAX_PACKET_DEPTH:
             raise ProtocolError("packet recursion limit exceeded")
+        if not isinstance(data, (bytes, bytearray)) or len(data) > MAX_PACKET_TOTAL_BYTES:
+            raise ProtocolError("packet input exceeds size budget")
+        budget["bytes"] += len(data)
+        if budget["bytes"] > MAX_PACKET_TOTAL_BYTES:
+            raise ProtocolError("packet expansion exceeds size budget")
         offset = 0
         while offset + PacketCodec.HEADER <= len(data):
             packet_length, header_length, protover, operation, sequence = struct.unpack_from(">IHHII", data, offset)
             if packet_length < header_length or header_length < PacketCodec.HEADER or offset + packet_length > len(data):
                 raise ProtocolError("invalid Bilibili packet length")
+            body_length = packet_length - header_length
+            if body_length > MAX_PACKET_BODY_BYTES:
+                raise ProtocolError("Bilibili packet body exceeds size budget")
+            budget["packets"] += 1
+            if budget["packets"] > MAX_PACKET_COUNT:
+                raise ProtocolError("too many packets in one payload")
             payload = data[offset + header_length: offset + packet_length]
             offset += packet_length
             if protover == 2 and operation == 5:
                 try:
-                    decompressed = zlib_decompress(payload)
+                    decompressed = zlib_decompress(payload, MAX_PACKET_BODY_BYTES)
                 except Exception as error:
                     raise ProtocolError(f"zlib decode failed: {error}") from error
-                yield from PacketCodec.decode(decompressed, depth + 1)
+                yield from PacketCodec.decode(decompressed, depth + 1, budget)
             elif protover == 3 and operation == 5:
                 try:
-                    decompressed = brotli_decompress(payload)
+                    decompressed = brotli_decompress(payload, MAX_PACKET_BODY_BYTES)
                 except Exception as error:
                     raise ProtocolError(f"Brotli decode unavailable or failed: {error}; install the optional 'brotli' package") from error
-                yield from PacketCodec.decode(decompressed, depth + 1)
+                yield from PacketCodec.decode(decompressed, depth + 1, budget)
             else:
                 yield operation, protover, payload
         if offset != len(data):
             raise ProtocolError("trailing bytes in Bilibili packet")
 
 
-def zlib_decompress(payload: bytes) -> bytes:
+def zlib_decompress(payload: bytes, limit: int = MAX_PACKET_BODY_BYTES) -> bytes:
     import zlib
-    return zlib.decompress(payload)
+    decoder = zlib.decompressobj()
+    output = decoder.decompress(payload, limit + 1)
+    if len(output) > limit or decoder.unconsumed_tail:
+        raise ProtocolError("zlib output exceeds size budget")
+    output += decoder.flush(limit + 1 - len(output))
+    if len(output) > limit:
+        raise ProtocolError("zlib output exceeds size budget")
+    return output
 
 
-def brotli_decompress(payload: bytes) -> bytes:
+def brotli_decompress(payload: bytes, limit: int = MAX_PACKET_BODY_BYTES) -> bytes:
     import brotli  # type: ignore
-    return brotli.decompress(payload)
+    decoder = brotli.Decompressor()
+    output = bytearray()
+    for offset in range(0, len(payload), 64 * 1024):
+        output.extend(decoder.process(payload[offset:offset + 64 * 1024]))
+        if len(output) > limit:
+            raise ProtocolError("Brotli output exceeds size budget")
+    return bytes(output)
 
 
 class WebSocketClient:
     def __init__(self, host: str, port: int, path: str, cookie: str) -> None:
         self.host, self.port, self.path, self.cookie = host, port, path, cookie
         self.sock: Optional[socket.socket] = None
+        self._read_buffer = bytearray()
+        self._fragment_opcode: Optional[int] = None
+        self._fragment_parts: List[bytes] = []
+        self._fragment_size = 0
 
     def connect(self, timeout: float = 15) -> None:
         raw = socket.create_connection((self.host, self.port), timeout=timeout)
-        context = ssl.create_default_context()
-        self.sock = context.wrap_socket(raw, server_hostname=self.host)
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        headers = [
-            f"GET {self.path} HTTP/1.1", f"Host: {self.host}:{self.port}", "Upgrade: websocket",
-            "Connection: Upgrade", f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13",
-            "Origin: https://live.bilibili.com", f"User-Agent: {USER_AGENT}",
-        ]
-        if self.cookie:
-            headers.append(f"Cookie: {self.cookie}")
-        self.sock.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii", "ignore"))
-        response = self._read_until(b"\r\n\r\n", 16384)
-        if not response.startswith(b"HTTP/1.1 101"):
-            raise ProtocolError(f"WebSocket handshake failed: {response[:120].decode('latin1', 'replace')}")
-        self.sock.settimeout(1.0)
+        try:
+            context = ssl.create_default_context()
+            self.sock = context.wrap_socket(raw, server_hostname=self.host)
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            headers = [
+                f"GET {self.path} HTTP/1.1", f"Host: {self.host}:{self.port}", "Upgrade: websocket",
+                "Connection: Upgrade", f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13",
+                "Origin: https://live.bilibili.com", f"User-Agent: {USER_AGENT}",
+            ]
+            if self.cookie:
+                headers.append(f"Cookie: {self.cookie}")
+            self.sock.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii", "ignore"))
+            response = self._read_until(b"\r\n\r\n", MAX_WS_HANDSHAKE_BYTES)
+            header_text = response.decode("latin1", "replace")
+            lines = header_text.split("\r\n")
+            status_parts = lines[0].split() if lines else []
+            if len(status_parts) < 2 or status_parts[0] != "HTTP/1.1" or status_parts[1] != "101":
+                raise ProtocolError(f"WebSocket handshake failed: {header_text[:120]}")
+            response_headers: Dict[str, str] = {}
+            for line in lines[1:]:
+                name, separator, value = line.partition(":")
+                if separator:
+                    response_headers[name.strip().lower()] = value.strip()
+            expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+            if response_headers.get("sec-websocket-accept") != expected:
+                raise ProtocolError("WebSocket handshake missing a valid Sec-WebSocket-Accept")
+            if response_headers.get("upgrade", "").lower() != "websocket" or "upgrade" not in response_headers.get("connection", "").lower():
+                raise ProtocolError("WebSocket handshake missing upgrade headers")
+            self.sock.settimeout(1.0)
+        except Exception:
+            self.close()
+            try:
+                raw.close()
+            except OSError:
+                pass
+            raise
 
     def close(self) -> None:
         sock, self.sock = self.sock, None
@@ -344,28 +553,70 @@ class WebSocketClient:
             first = self._read_exact(2)
         except socket.timeout:
             return None
+        except ProtocolError:
+            raise
         if not first:
             return (0x8, b"")
         first_byte, second_byte = first
+        fin = bool(first_byte & 0x80)
+        if first_byte & 0x70:
+            raise ProtocolError("WebSocket RSV bits are not negotiated")
         opcode = first_byte & 0x0F
-        length = second_byte & 0x7F
-        if length == 126:
-            length = struct.unpack(">H", self._read_exact(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", self._read_exact(8))[0]
-        masked = bool(second_byte & 0x80)
-        mask = self._read_exact(4) if masked else b""
-        payload = self._read_exact(length)
-        if masked:
-            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        if second_byte & 0x80:
+            raise ProtocolError("server WebSocket frame must not be masked")
+        try:
+            length = second_byte & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._read_exact(8))[0]
+            if length > MAX_WS_FRAME_BYTES:
+                raise ProtocolError("WebSocket frame exceeds size budget")
+            if opcode >= 0x8 and (not fin or length > 125):
+                raise ProtocolError("invalid WebSocket control frame")
+            payload = self._read_exact(length)
+        except socket.timeout as error:
+            raise ProtocolError("WebSocket frame read timed out") from error
         if opcode == 0x9:
             self._send_frame(0xA, payload)
+            return None
+        if opcode == 0xA:
+            return None
+        if opcode == 0x8:
+            return opcode, payload
+        if opcode == 0x0:
+            if self._fragment_opcode is None:
+                raise ProtocolError("unexpected WebSocket continuation frame")
+            self._fragment_parts.append(payload)
+            self._fragment_size += len(payload)
+            if self._fragment_size > MAX_WS_MESSAGE_BYTES:
+                raise ProtocolError("WebSocket message exceeds size budget")
+            if not fin:
+                return None
+            opcode = self._fragment_opcode
+            payload = b"".join(self._fragment_parts)
+            self._fragment_opcode = None
+            self._fragment_parts = []
+            self._fragment_size = 0
+            return opcode, payload
+        if opcode not in (0x1, 0x2):
+            raise ProtocolError("unsupported WebSocket opcode")
+        if self._fragment_opcode is not None:
+            raise ProtocolError("new WebSocket data frame interrupted a fragmented message")
+        if not fin:
+            self._fragment_opcode = opcode
+            self._fragment_parts = [payload]
+            self._fragment_size = len(payload)
             return None
         return opcode, payload
 
     def _send_frame(self, opcode: int, payload: bytes) -> None:
         if not self.sock:
             raise ProtocolError("WebSocket is not connected")
+        if opcode >= 0x8 and len(payload) > 125:
+            raise ProtocolError("control frame exceeds WebSocket size limit")
+        if len(payload) > MAX_WS_MESSAGE_BYTES:
+            raise ProtocolError("WebSocket message exceeds size budget")
         mask = os.urandom(4)
         length = len(payload)
         if length < 126:
@@ -383,31 +634,79 @@ class WebSocketClient:
         chunks = []
         remaining = length
         while remaining:
-            chunk = self.sock.recv(remaining)
+            if self._read_buffer:
+                take = min(remaining, len(self._read_buffer))
+                chunk = bytes(self._read_buffer[:take])
+                del self._read_buffer[:take]
+            else:
+                chunk = self.sock.recv(remaining)
             if not chunk:
+                if chunks:
+                    raise ProtocolError("truncated WebSocket frame")
                 return b""
             chunks.append(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
 
     def _read_until(self, marker: bytes, limit: int) -> bytes:
-        data = b""
-        while marker not in data and len(data) < limit:
+        while marker not in self._read_buffer:
             chunk = self.sock.recv(1024) if self.sock else b""
             if not chunk:
                 break
-            data += chunk
-        return data
+            self._read_buffer.extend(chunk)
+            if len(self._read_buffer) > limit:
+                raise ProtocolError("WebSocket handshake exceeds size budget")
+        index = self._read_buffer.find(marker)
+        if index < 0:
+            raise ProtocolError("incomplete WebSocket handshake")
+        end = index + len(marker)
+        response = bytes(self._read_buffer[:end])
+        del self._read_buffer[:end]
+        return response
 
 
 class EventStore:
+    SCHEMA_VERSION = SCHEMA_VERSION
+    SchemaVersionError = SchemaVersionError
+
     def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(path), check_same_thread=False)
+        path_text = str(path)
+        if path_text != ":memory:":
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path_text, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("PRAGMA busy_timeout=5000")
+        try:
+            self._ensure_schema()
+        except Exception:
+            self.connection.close()
+            raise
+        self._reconcile_interrupted_sessions()
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
+
+    def _ensure_schema(self) -> None:
+        version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+        tables = {
+            row[0] for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        expected_tables = {"sessions", "events", "metric_snapshots", "capture_gaps"}
+        if tables and version != self.SCHEMA_VERSION:
+            raise SchemaVersionError(f"Bilibili compatibility database schema {version} requires an explicit migration to {self.SCHEMA_VERSION}")
+        if tables and not expected_tables.issubset(tables):
+            raise SchemaVersionError("Bilibili compatibility database schema is incomplete; refusing to write")
+        if version > self.SCHEMA_VERSION:
+            raise SchemaVersionError(f"Bilibili compatibility database schema {version} is newer than supported {self.SCHEMA_VERSION}")
+        if version != 0 and not tables:
+            raise SchemaVersionError(f"Bilibili compatibility database schema {version} has no matching schema; refusing to write")
+        if tables:
+            verify_schema_signature(self.connection)
+            return
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS sessions(
           id INTEGER PRIMARY KEY, room_id TEXT NOT NULL, room_title TEXT NOT NULL,
@@ -424,11 +723,27 @@ class EventStore:
           online INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, danmaku_rate REAL DEFAULT 0,
           total_danmaku INTEGER DEFAULT 0, FOREIGN KEY(session_id) REFERENCES sessions(id)
         );
+        CREATE TABLE IF NOT EXISTS capture_gaps(
+          id INTEGER PRIMARY KEY, provider TEXT NOT NULL, room_id TEXT NOT NULL,
+          session_id INTEGER, run_id TEXT, gap_start TEXT NOT NULL, gap_end TEXT,
+          reason TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'collector',
+          status TEXT NOT NULL DEFAULT 'open', FOREIGN KEY(session_id) REFERENCES sessions(id)
+        );
         CREATE INDEX IF NOT EXISTS idx_events_session_time ON events(session_id, event_time);
         CREATE INDEX IF NOT EXISTS idx_events_type ON events(session_id, event_type);
         CREATE INDEX IF NOT EXISTS idx_metrics_session_time ON metric_snapshots(session_id, recorded_at);
+        CREATE INDEX IF NOT EXISTS idx_capture_gaps_session_time ON capture_gaps(session_id, gap_start, gap_end);
         """)
+        self.connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
         self.connection.commit()
+
+    def _reconcile_interrupted_sessions(self) -> None:
+        with self.lock:
+            self.connection.execute(
+                "UPDATE sessions SET ended_at=COALESCE(ended_at, ?), status='interrupted' WHERE status='running'",
+                (utc_now(),),
+            )
+            self.connection.commit()
 
     def start_session(self, room_id: str, title: str) -> int:
         with self.lock:
@@ -449,16 +764,37 @@ class EventStore:
 
     def insert_snapshot(self, session_id: int, metrics: Dict[str, Any]) -> None:
         with self.lock:
-            self.connection.execute("INSERT INTO metric_snapshots(session_id,recorded_at,online,likes,danmaku_rate,total_danmaku) VALUES(?,?,?,?,?,?)", (session_id, utc_now(), metrics.get("online", 0), metrics.get("likes", 0), metrics.get("rate", 0), metrics.get("total", 0)))
+            self.connection.execute("INSERT INTO metric_snapshots(session_id,recorded_at,online,likes,danmaku_rate,total_danmaku) VALUES(?,?,?,?,?,?)", (session_id, utc_now(), metrics.get("online") if metrics.get("online") is None else safe_int(metrics.get("online")), metrics.get("likes", 0), metrics.get("rate", 0), metrics.get("total", 0)))
             self.connection.commit()
 
-    def recent_events(self, session_id: Optional[int], limit: int = 100) -> List[Dict[str, Any]]:
+    def recent_events(self, session_id: Optional[int], limit: Optional[int] = 100, since: Optional[str] = None) -> List[Dict[str, Any]]:
+        clauses = []
+        params: List[Any] = []
+        if session_id:
+            clauses.append("session_id=?")
+            params.append(session_id)
+        if since:
+            clauses.append("event_time>=?")
+            params.append(since)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(max(safe_int(limit, 100), 1))
         with self.lock:
-            if session_id:
-                rows = self.connection.execute("SELECT event_time,event_type,uid,uname,text,gift_name,gift_num,amount,popularity FROM events WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit)).fetchall()
-            else:
-                rows = self.connection.execute("SELECT event_time,event_type,uid,uname,text,gift_name,gift_num,amount,popularity FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [dict(row) for row in reversed(rows)]
+            rows = self.connection.execute(f"SELECT event_time,event_type,uid,uname,text,gift_name,gift_num,amount,popularity FROM events{where} ORDER BY id DESC{limit_sql}", params).fetchall()
+        result = []
+        for row in reversed(rows):
+            item = dict(row)
+            if item.get("event_type") == "gift":
+                item["value_contract"] = {
+                    "quantity": item.get("gift_num"), "quantity_unit": "item",
+                    "raw_platform_value": item.get("amount"), "currency": None,
+                    "estimated_value": None, "estimated": False,
+                    "value_semantics": "platform_amount_without_currency",
+                }
+            result.append(item)
+        return result
 
     def recent_snapshots(self, session_id: Optional[int], limit: int = 60) -> List[Dict[str, Any]]:
         with self.lock:
@@ -467,6 +803,72 @@ class EventStore:
             else:
                 rows = self.connection.execute("SELECT recorded_at,online,likes,danmaku_rate,total_danmaku FROM metric_snapshots ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in reversed(rows)]
+
+    def open_gap(self, provider: str, room_id: str, session_id: Optional[int], run_id: Optional[str], reason: str, started_at: Optional[str] = None, source: str = "collector") -> int:
+        with self.lock:
+            if session_id is not None and not self.connection.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+                return 0
+            existing = self.connection.execute(
+                """SELECT id FROM capture_gaps
+                WHERE provider=? AND room_id=? AND session_id IS ? AND run_id IS ?
+                  AND reason=? AND status='open' ORDER BY id DESC LIMIT 1""",
+                (provider, room_id, session_id, run_id, reason),
+            ).fetchone()
+            if existing:
+                return int(existing[0])
+            cursor = self.connection.execute(
+                """INSERT INTO capture_gaps(provider,room_id,session_id,run_id,gap_start,reason,source,status)
+                VALUES(?,?,?,?,?,?,?,'open')""",
+                (provider, room_id, session_id, run_id, started_at or utc_now(), reason, source),
+            )
+            self.connection.commit()
+            return int(cursor.lastrowid)
+
+    def close_gap(self, gap_id: int, ended_at: Optional[str] = None) -> bool:
+        with self.lock:
+            cursor = self.connection.execute("UPDATE capture_gaps SET gap_end=?, status='closed' WHERE id=? AND status='open'", (ended_at or utc_now(), gap_id))
+            self.connection.commit()
+            return cursor.rowcount == 1
+
+    def close_open_gaps(self, session_id: int, run_id: Optional[str] = None, ended_at: Optional[str] = None) -> int:
+        with self.lock:
+            if run_id is None:
+                cursor = self.connection.execute("UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND status='open'", (ended_at or utc_now(), session_id))
+            else:
+                cursor = self.connection.execute("UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND run_id=? AND status='open'", (ended_at or utc_now(), session_id, run_id))
+            self.connection.commit()
+            return cursor.rowcount
+
+    def gaps(self, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        with self.lock:
+            rows = self.connection.execute("SELECT * FROM capture_gaps" + (" WHERE session_id=?" if session_id is not None else "") + " ORDER BY id", (session_id,) if session_id is not None else ()).fetchall()
+        return [dict(row) for row in rows]
+
+    def coverage(self, session_id: int, start: str, end: str) -> Dict[str, Any]:
+        start_dt = parse_utc_timestamp(start)
+        end_dt = parse_utc_timestamp(end)
+        if start_dt is None or end_dt is None or end_dt <= start_dt:
+            raise ValueError("coverage window must contain valid ordered timestamps")
+        rows = [
+            gap for gap in self.gaps(session_id)
+            if (gap_start := parse_utc_timestamp(gap["gap_start"])) is not None
+            and gap_start < end_dt
+            and (gap["gap_end"] is None or (gap_end := parse_utc_timestamp(gap["gap_end"])) is None or gap_end > start_dt)
+        ]
+        with self.lock:
+            event_times = [row[0] for row in self.connection.execute("SELECT event_time FROM events WHERE session_id=?", (session_id,))]
+            snapshot_times = [row[0] for row in self.connection.execute("SELECT recorded_at FROM metric_snapshots WHERE session_id=?", (session_id,))]
+        event_count = sum(1 for value in event_times if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt)
+        snapshot_count = sum(1 for value in snapshot_times if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt)
+        if rows:
+            coverage_state = "gap"
+        elif event_count:
+            coverage_state = "reliable_with_data"
+        elif snapshot_count:
+            coverage_state = "reliable_no_events"
+        else:
+            coverage_state = "unknown"
+        return {"session_id": session_id, "start": start, "end": end, "coverage_state": coverage_state, "complete": coverage_state in {"reliable_with_data", "reliable_no_events"}, "has_open_gap": any(gap["gap_end"] is None for gap in rows), "event_count": event_count, "snapshot_count": snapshot_count, "gaps": rows}
 
     def close(self) -> None:
         with self.lock:
@@ -552,18 +954,24 @@ def parse_business_event(body: bytes) -> Optional[Dict[str, Any]]:
         event.update(type="danmaku", text=str(info[1] if len(info) > 1 else ""), uid=safe_int(user[0] if user else 0), uname=str(user[1] if len(user) > 1 else "匿名用户"))
         return event
     if command.startswith("SEND_GIFT"):
-        event.update(type="gift", uid=safe_int(data.get("uid")), uname=str(data.get("uname") or "匿名用户"), gift_name=str(data.get("giftName") or "礼物"), gift_num=safe_int(data.get("num"), 1), amount=safe_int(data.get("price")))
+        gift_num = safe_int(data.get("num"), 1)
+        platform_amount = optional_int(data.get("price"))
+        event.update(
+            type="gift", uid=safe_int(data.get("uid")), uname=str(data.get("uname") or "匿名用户"),
+            gift_name=str(data.get("giftName") or "礼物"), gift_num=gift_num, amount=platform_amount,
+            value_contract={"quantity": gift_num, "quantity_unit": "item", "quantity_semantics": "platform_reported", "unit_price": platform_amount, "currency": None, "estimated_value": None, "estimated": False, "value_semantics": "platform_amount_without_currency"},
+        )
         return event
     if command.startswith("SUPER_CHAT_MESSAGE"):
         user = data.get("user_info") or {}
-        event.update(type="sc", uid=safe_int(user.get("uid") or data.get("uid")), uname=str(user.get("uname") or data.get("uname") or "匿名用户"), text=str(data.get("message") or ""), amount=safe_int(data.get("price")))
+        event.update(type="sc", uid=safe_int(user.get("uid") or data.get("uid")), uname=str(user.get("uname") or data.get("uname") or "匿名用户"), text=str(data.get("message") or ""), amount=optional_int(data.get("price")))
         return event
     if command.startswith("INTERACT_WORD"):
         interact = parse_interact_word_v2(data) or {"uid": safe_int(data.get("uid")), "uname": str(data.get("uname") or "匿名用户"), "msg_type": safe_int(data.get("msg_type"), 1)}
         event.update(type="entry" if safe_int(interact.get("msg_type"), 1) == 1 else "interact", uid=safe_int(interact.get("uid")), uname=str(interact.get("uname") or "匿名用户"), text="进入直播间" if safe_int(interact.get("msg_type"), 1) == 1 else "互动")
         return event
     if command.startswith("WATCHED_CHANGE"):
-        event.update(type="online", popularity=safe_int(data.get("num")))
+        event.update(type="online", popularity=optional_int(data.get("num")))
         return event
     if command.startswith("LIKE_INFO_V3") or command.startswith("LIKE_INFO"):
         event.update(type="like", uid=safe_int(data.get("uid")), uname=str(data.get("uname") or "匿名用户"), text="点赞")
@@ -574,10 +982,13 @@ def parse_business_event(body: bytes) -> Optional[Dict[str, Any]]:
 class Collector:
     def __init__(self, store: EventStore) -> None:
         self.store = store
+        self.command_lock = threading.RLock()
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.socket: Optional[WebSocketClient] = None
+        self._context: Optional[RunContext] = None
+        self.generation = 0
         self.session_id: Optional[int] = None
         self.last_session_id: Optional[int] = None
         self.room_id = ""
@@ -585,70 +996,128 @@ class Collector:
         self.status_name = "idle"
         self.last_error = ""
         self.online = 0
+        self.online_observed = False
         self.online_event_seen = False
         self.likes = 0
         self.total = 0
         self.started_at = ""
+        self.last_valid_at = ""
+        self._last_valid_monotonic = 0.0
         self.last_snapshot = 0.0
         self.minute_events: List[float] = []
         self.sessdata = ""
         self.buvid3 = ""
         self.diagnostics: Dict[str, Any] = {}
 
-    def start(self, room_id: str, sessdata: str = "") -> None:
-        self.stop()
-        with self.lock:
-            self.room_id, self.sessdata, self.last_error = str(room_id).strip(), sessdata.strip(), ""
-            self.room_title = ""
-            self.last_session_id = None
-            self.online = 0
-            self.online_event_seen = False
-            self.likes = 0
-            self.total = 0
-            self.minute_events = []
-            self.last_snapshot = 0.0
-            self.diagnostics = {}
-            self.status_name = "connecting"
-            self.stop_event = threading.Event()
-            self.thread = threading.Thread(target=self._run, name="bili-collector", daemon=True)
-            self.thread.start()
+    def start(self, room_id: str, sessdata: str = "") -> RunContext:
+        with self.command_lock:
+            with self.lock:
+                if self.thread and self.thread.is_alive():
+                    raise BusyError("previous collector run is still stopping")
+                self.thread = None
+                self.generation += 1
+                context = RunContext(self.generation, uuid.uuid4().hex, "bilibili", str(room_id).strip(), sessdata.strip())
+                self._context = context
+                self.room_id, self.sessdata, self.last_error = context.room_id, context.sessdata, ""
+                self.room_title = ""
+                self.last_session_id = None
+                self.online = 0
+                self.online_observed = False
+                self.online_event_seen = False
+                self.likes = 0
+                self.total = 0
+                self.minute_events = []
+                self.last_valid_at = ""
+                self._last_valid_monotonic = 0.0
+                self.last_snapshot = 0.0
+                self.diagnostics = {}
+                self.status_name = "connecting"
+                self.stop_event = context.cancel
+                self.thread = threading.Thread(target=self._run, args=(context,), name=f"bili-collector-{context.generation}", daemon=True)
+                self.thread.start()
+                return context
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> bool:
+        with self.command_lock:
+            with self.lock:
+                context, thread = self._context, self.thread
+                if context is None or thread is None:
+                    if context is not None:
+                        self.status_name = "stopped"
+                    return True
+                context.cancel.set()
+                self.stop_event = context.cancel
+                self.status_name = "stopping"
+                current_socket = self.socket
+                self.socket = None
+            if current_socket:
+                current_socket.close()
+            if thread is threading.current_thread():
+                return False
+            thread.join(max(0.0, timeout))
+            with self.lock:
+                if thread.is_alive():
+                    if self._context is context:
+                        self.status_name = "stopping"
+                    return False
+                if self._context is context:
+                    self.status_name = "stopped"
+                    self.thread = None
+                return True
+
+    def is_current_run(self, context: RunContext) -> bool:
         with self.lock:
-            self.stop_event.set()
-            current_socket = self.socket
-            session_id = self.session_id
-            self.socket = None
-        if current_socket:
-            current_socket.close()
-        if self.thread and self.thread is not threading.current_thread():
-            self.thread.join(timeout=2)
-        if session_id:
-            self.store.end_session(session_id)
+            return self._context is context and not context.cancel.is_set()
+
+    def _owns_active_run(self, context: RunContext) -> bool:
         with self.lock:
-            if session_id:
-                self.last_session_id = session_id
+            return self._context is context and not context.cancel.is_set() and self.status_name in {"connecting", "authenticating", "connected", "stale"}
+
+    def _mark_valid(self, context: RunContext) -> bool:
+        with self.lock:
+            if self._context is not context or context.cancel.is_set():
+                return False
+            self.last_valid_at = utc_now()
+            self._last_valid_monotonic = time.monotonic()
+            if self.status_name == "stale":
+                self.status_name = "connected"
                 self.last_error = ""
-            self.thread = None
-            self.session_id = None
-            self.status_name = "idle"
+            if self.session_id:
+                self.store.close_open_gaps(self.session_id, context.run_id)
+            return True
+
+    def _expire_stale_locked(self) -> None:
+        if self.status_name == "connected" and self._last_valid_monotonic and time.monotonic() - self._last_valid_monotonic > FRESHNESS_TIMEOUT_SECONDS:
+            self.status_name = "stale"
+            self.last_error = "connection stale: no valid protocol frame"
+            context = self._context
+            if context and self.session_id:
+                self.store.open_gap(
+                    "bilibili", self.room_id, self.session_id, context.run_id, "stale",
+                    started_at=stale_gap_start(self.last_valid_at, FRESHNESS_TIMEOUT_SECONDS),
+                )
 
     def data_session_id(self) -> Optional[int]:
         with self.lock:
-            return self.session_id or self.last_session_id
+            return self.session_id if self.status_name in {"connecting", "authenticating", "connected", "stale"} else None
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
-            return {"available": True, "connected": self.status_name == "connected", "status": self.status_name, "room_id": self.room_id, "room_title": self.room_title, "session_id": self.session_id, "online": self.online, "likes": self.likes, "total": self.total, "rate": self._rate(), "last_error": self.last_error, "diagnostics": self.diagnostics}
+            self._expire_stale_locked()
+            connected = self.status_name == "connected" and self.session_id is not None
+            context = self._context
+            online = self.online if connected and self.online_observed else None
+            return {"available": True, "connected": connected, "status": self.status_name, "data_source": "bilibili_websocket" if connected else "none", "room_id": self.room_id, "room_title": self.room_title, "session_id": self.session_id if connected else None, "generation": context.generation if context else 0, "run_id": context.run_id if context else None, "worker_alive": bool(self.thread and self.thread.is_alive()), "online": online, "online_known": online is not None, "online_measure": {"kind": "online_people", "value": online, "unit": "people", "source": "bilibili_protocol"} if online is not None else None, "likes": self.likes if connected else 0, "total": self.total if connected else 0, "rate": self._rate() if connected else 0, "last_valid_at": self.last_valid_at, "freshness_timeout_seconds": FRESHNESS_TIMEOUT_SECONDS, "last_error": self.last_error, "diagnostics": self.diagnostics}
 
     def metrics(self) -> Dict[str, Any]:
         with self.lock:
+            self._expire_stale_locked()
             ranking: Dict[str, int] = {}
             keywords: Dict[str, int] = {}
-            revenue = 0.0
-            session_id = self.session_id or self.last_session_id
+            gift_quantity = 0
+            session_id = self.session_id if self.status_name == "connected" else None
             if session_id:
-                rows = self.store.recent_events(session_id, 500)
+                rows = self.store.recent_events(session_id, None)
                 for row in rows:
                     if row.get("uname") and row.get("event_type") in ("danmaku", "sc"):
                         ranking[row["uname"]] = ranking.get(row["uname"], 0) + 1
@@ -656,77 +1125,101 @@ class Collector:
                         for word in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]{2,}", row.get("text") or ""):
                             keywords[word] = keywords.get(word, 0) + 1
                     if row.get("event_type") == "gift":
-                        revenue += safe_int(row.get("amount")) / 1000
-                    elif row.get("event_type") == "sc":
-                        revenue += safe_int(row.get("amount"))
+                        gift_quantity += max(safe_int(row.get("gift_num")), 0)
             trend = self.store.recent_snapshots(session_id, 60)
             current = self.status()
             if current["connected"]:
                 trend.append({"recorded_at": utc_now(), "online": current["online"], "likes": current["likes"], "danmaku_rate": current["rate"], "total_danmaku": current["total"]})
-            return {**current, "ranking": sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:10], "keywords": sorted(keywords.items(), key=lambda item: item[1], reverse=True)[:10], "revenue": round(revenue, 2), "trend": trend}
+            return {**current, "ranking": sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:10], "keywords": sorted(keywords.items(), key=lambda item: item[1], reverse=True)[:10], "gift_quantity": gift_quantity, "revenue": None, "revenue_currency": None, "revenue_semantics": "unknown_currency_not_estimated", "trend": trend}
 
-    def _run(self) -> None:
-        client = HttpClient(sessdata=self.sessdata)
+    def _run(self, context: RunContext) -> None:
+        client = HttpClient(sessdata=context.sessdata)
+        session_id: Optional[int] = None
+        terminal_status = "stopped"
         try:
-            room = client.get_room(self.room_id)
+            room = client.get_room(context.room_id)
+            if context.cancel.is_set():
+                return
             danmaku = client.get_danmaku_info(room["room_id"])
             self.buvid3 = client.buvid3
             with self.lock:
+                if not self._owns_active_run(context):
+                    return
                 self.diagnostics = client.diagnostics()
                 self.room_id, self.room_title = room["room_id"], room["title"]
-                self.online = safe_int(room.get("online"))
-                self.session_id = self.store.start_session(self.room_id, self.room_title)
+                parsed_online = optional_int(room.get("online"))
+                self.online = parsed_online if parsed_online is not None else 0
+                self.online_observed = parsed_online is not None
+                session_id = self.store.start_session(self.room_id, self.room_title)
+                self.session_id = session_id
+                self.store.open_gap("bilibili", self.room_id, session_id, context.run_id, "connecting")
                 self.started_at = utc_now()
                 self.status_name = "connecting"
             last_error = None
             for host_info in danmaku["hosts"]:
-                if self.stop_event.is_set():
+                if context.cancel.is_set():
                     return
                 host = str(host_info.get("host") or "")
                 port = safe_int(host_info.get("wss_port"), 443)
                 if not host:
                     continue
+                ws: Optional[WebSocketClient] = None
                 try:
                     ws = WebSocketClient(host, port, "/sub", client.cookie)
                     ws.connect()
                     with self.lock:
+                        if not self._owns_active_run(context):
+                            return
                         self.socket = ws
-                        self.status_name = "connected"
-                    ws.send_binary(PacketCodec.auth(self.room_id, danmaku["token"], uid=client.uid, buvid3=self.buvid3))
-                    self._receive_loop(ws)
+                        self.status_name = "authenticating"
+                    ws.send_binary(PacketCodec.auth(room["room_id"], danmaku["token"], uid=client.uid, buvid3=self.buvid3))
+                    self._receive_loop(context, ws)
                     return
                 except Exception as error:
                     last_error = str(error)
-                    if self.stop_event.is_set():
+                    if context.cancel.is_set():
                         return
+                finally:
+                    if ws:
+                        ws.close()
+                    with self.lock:
+                        if self._context is context and self.socket is ws:
+                            self.socket = None
             raise ProtocolError(last_error or "all Bilibili WebSocket hosts failed")
         except Exception as error:
             with self.lock:
-                if self.stop_event.is_set():
-                    self.status_name = "stopped"
-                else:
+                if self._context is context and not context.cancel.is_set():
+                    terminal_status = "error"
                     self.status_name = "error"
                     self.last_error = str(error)
-                self.diagnostics = client.diagnostics()
+                elif self._context is context:
+                    self.status_name = "stopping"
         finally:
-            with self.lock:
-                current_session = self.session_id
-                self.socket = None
-                if self.status_name == "connected":
-                    self.status_name = "stopped"
-                self.session_id = None
-                if current_session:
-                    self.last_session_id = current_session
-            if current_session:
-                self.store.end_session(current_session, "error" if self.last_error else "stopped")
+            self._finish_run(context, session_id, terminal_status)
 
-    def _receive_loop(self, ws: WebSocketClient) -> None:
+    def _finish_run(self, context: RunContext, session_id: Optional[int], terminal_status: str) -> None:
+        with self.lock:
+            owner = self._context is context
+            if owner:
+                self.socket = None
+                if self.session_id == session_id:
+                    self.session_id = None
+                if session_id:
+                    self.last_session_id = session_id
+                if self.status_name in {"connecting", "authenticating", "connected", "stale", "stopping"}:
+                    self.status_name = "error" if terminal_status == "error" else "stopped"
+        if session_id:
+            self.store.close_open_gaps(session_id, context.run_id)
+            self.store.end_session(session_id, terminal_status)
+
+    def _receive_loop(self, context: RunContext, ws: WebSocketClient) -> None:
         last_heartbeat = 0.0
-        while not self.stop_event.is_set():
+        while not context.cancel.is_set():
             now = time.time()
             if now - last_heartbeat >= 30:
                 ws.send_binary(PacketCodec.heartbeat())
                 last_heartbeat = now
+            self._record_heartbeat_snapshot(context)
             received = ws.receive()
             if received is None:
                 continue
@@ -735,35 +1228,73 @@ class Collector:
                 raise ProtocolError("Bilibili WebSocket closed the connection")
             if opcode not in (0x1, 0x2):
                 continue
-            self._handle_packet(payload)
+            self._handle_packet(context, payload)
 
-    def _handle_packet(self, payload: bytes) -> None:
-        for operation, _protover, body in PacketCodec.decode(payload):
+    def _record_heartbeat_snapshot(self, context: RunContext) -> None:
+        with self.lock:
+            if not self._owns_active_run(context) or not self.session_id or time.time() - self.last_snapshot < 30:
+                return
+            session_id = self.session_id
+        snapshot = self.status()
+        with self.lock:
+            if self._context is not context or context.cancel.is_set() or self.session_id != session_id:
+                return
+            self.store.insert_snapshot(session_id, snapshot)
+            self.last_snapshot = time.time()
+
+    def _handle_packet(self, context_or_payload: Any, payload: Optional[bytes] = None) -> None:
+        legacy = payload is None
+        context = None if legacy else context_or_payload
+        payload = context_or_payload if legacy else payload
+        if context is not None and not self._owns_active_run(context):
+            return
+        packets = list(PacketCodec.decode(payload))
+        if context is not None:
+            if not self._mark_valid(context):
+                return
+        else:
+            with self.lock:
+                if self.status_name not in {"connecting", "authenticating", "connected", "stale"} or self.session_id is None:
+                    return
+                self.last_valid_at = utc_now()
+                self._last_valid_monotonic = time.monotonic()
+        for operation, _protover, body in packets:
             if operation == 8:
                 try:
-                    auth_result = json.loads(body.decode("utf-8", "replace")) if body else {}
-                    if isinstance(auth_result, dict) and safe_int(auth_result.get("code"), 0) != 0:
-                        raise ProtocolError(f"Bilibili WebSocket authentication failed: {auth_result.get('message') or auth_result.get('code')}")
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    pass
+                    auth_result = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ProtocolError("Bilibili WebSocket authentication response is not valid JSON") from error
+                if not isinstance(auth_result, dict) or isinstance(auth_result.get("code"), bool) or "code" not in auth_result or safe_int(auth_result.get("code"), -1) != 0:
+                    raise ProtocolError("Bilibili WebSocket authentication response did not explicitly confirm code=0")
+                with self.lock:
+                    if (context is None or self._context is context) and self.status_name == "authenticating":
+                        self.status_name = "connected"
+                        if context is not None and self.session_id:
+                            self.store.close_open_gaps(self.session_id, context.run_id)
                 continue
             if operation == 3 and len(body) >= 4:
                 with self.lock:
-                    if not self.online_event_seen:
+                    if (context is None or self._context is context) and not self.online_event_seen:
                         self.online = struct.unpack_from(">I", body, 0)[0]
+                        self.online_observed = True
                 continue
             if operation != 5:
                 continue
             event = parse_business_event(body)
             with self.lock:
+                if context is not None and not self._owns_active_run(context):
+                    continue
                 session_id = self.session_id
             if not event or not session_id:
                 continue
             event_type = event.get("type")
             if event_type == "online":
                 with self.lock:
-                    self.online = event.get("popularity", 0)
-                    self.online_event_seen = True
+                    popularity = optional_int(event.get("popularity"))
+                    if popularity is not None:
+                        self.online = popularity
+                        self.online_observed = True
+                        self.online_event_seen = True
             elif event_type == "like":
                 with self.lock:
                     self.likes += 1
@@ -782,12 +1313,46 @@ class Collector:
         return len(self.minute_events)
 
 
+class RequestError(ValueError):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def read_body_with_deadline(stream: Any, length: int, timeout: float) -> bytes:
+    deadline = time.monotonic() + max(float(timeout), 0.001)
+    chunks: List[bytes] = []
+    remaining = length
+    while remaining:
+        if time.monotonic() >= deadline:
+            raise RequestError(408, "request body timeout")
+        try:
+            chunk = stream.read(min(8192, remaining))
+        except (socket.timeout, TimeoutError) as error:
+            raise RequestError(408, "request body timeout") from error
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if remaining:
+        if time.monotonic() >= deadline:
+            raise RequestError(408, "request body timeout")
+        raise RequestError(400, "incomplete request body")
+    return b"".join(chunks)
+
+
 class AppHandler(SimpleHTTPRequestHandler):
     collector: Any
+    capability_token = ""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs["directory"] = str(ROOT)
         super().__init__(*args, **kwargs)
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(REQUEST_TIMEOUT_SECONDS)
 
     def log_message(self, format_string: str, *args: Any) -> None:
         if self.path.startswith("/api/"):
@@ -806,22 +1371,135 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def do_OPTIONS(self) -> None:
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    def _request_port(self) -> int:
+        return int(self.server.server_address[1])
+
+    def _local_host(self, value: str) -> bool:
+        try:
+            parsed = urllib.parse.urlsplit("//" + value.strip())
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+        except ValueError:
+            return False
+        if hostname not in {"127.0.0.1", "localhost"}:
+            return False
+        return port == self._request_port() if port is not None else self._request_port() == 80
+
+    def _local_origin(self, value: str) -> bool:
+        if value == "null":
+            return False
+        try:
+            parsed = urllib.parse.urlparse(value)
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+        except ValueError:
+            return False
+        return parsed.scheme == "http" and hostname in {"127.0.0.1", "localhost"} and port == self._request_port()
+
+    def _check_request_boundary(self) -> bool:
+        if not self._local_host(self.headers.get("Host", "")):
+            self._send_json({"error": "invalid local host"}, 403)
+            return False
+        origin = self.headers.get("Origin")
+        if origin and not self._local_origin(origin):
+            self._send_json({"error": "invalid local origin"}, 403)
+            return False
+        return True
+
+    def _authorize_api(self, path: str) -> bool:
+        if not self._check_request_boundary():
+            return False
+        if path in PUBLIC_API_PATHS:
+            return True
+        if path not in PROTECTED_API_PATHS:
+            self._send_json({"error": "not found"}, 404)
+            return False
+        provided = self.headers.get("X-Bullet-Screen-Token", "")
+        if not self.capability_token or not hmac.compare_digest(provided, self.capability_token):
+            self._send_json({"error": "local capability token required"}, 401)
+            return False
+        return True
+
+    def _static_file(self) -> Optional[Path]:
+        path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+        relative = STATIC_FILES.get(path)
+        if not relative:
+            return None
+        candidate = (ROOT / relative).resolve()
+        try:
+            candidate.relative_to(ROOT)
+        except ValueError:
+            return None
+        return candidate if candidate.is_file() else None
+
+    def _serve_static(self, head_only: bool = False) -> None:
+        candidate = self._static_file()
+        if not candidate:
+            self.send_error(404)
+            return
+        content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(candidate.stat().st_size))
         self.end_headers()
+        if not head_only:
+            with candidate.open("rb") as stream:
+                self.wfile.write(stream.read())
+
+    def _read_json_body(self) -> Dict[str, Any]:
+        if self.headers.get("Transfer-Encoding"):
+            raise RequestError(400, "transfer encoding is not supported")
+        content_lengths = self.headers.get_all("Content-Length") or []
+        if len(content_lengths) != 1 or not re.fullmatch(r"(?:0|[1-9][0-9]*)", content_lengths[0].strip()):
+            raise RequestError(400, "invalid content length")
+        length = int(content_lengths[0])
+        if length > MAX_REQUEST_BYTES:
+            raise RequestError(413, "request body too large")
+        content_types = self.headers.get_all("Content-Type") or []
+        if len(content_types) != 1 or content_types[0].split(";", 1)[0].strip().lower() != "application/json":
+            raise RequestError(415, "application/json is required")
+        body = read_body_with_deadline(self.rfile, length, REQUEST_TIMEOUT_SECONDS)
+        if not body:
+            return {}
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RequestError(400, "invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise RequestError(400, "JSON object is required")
+        return payload
+
+    def do_OPTIONS(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if not self._authorize_api(parsed.path):
+            return
+        self.send_response(204)
+        self.send_header("Allow", "GET, POST, OPTIONS")
+        self.end_headers()
+
+    def do_HEAD(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/"):
+            if self._authorize_api(parsed.path):
+                self.send_error(405)
+            return
+        if not self._check_request_boundary():
+            return
+        self._serve_static(head_only=True)
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/") and not self._authorize_api(parsed.path):
+            return
         if parsed.path == "/api/health":
             self._send_json({"ok": True, "service": getattr(self.collector, "provider_name", "live-intelligence-local")})
+            return
+        if parsed.path == "/api/bootstrap":
+            self._send_json({"token": self.capability_token})
             return
         if parsed.path == "/api/status":
             self._send_json(self.collector.status())
@@ -832,22 +1510,33 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/events":
             query = urllib.parse.parse_qs(parsed.query)
             limit = min(max(safe_int((query.get("limit") or [100])[0], 100), 1), 500)
-            if hasattr(self.collector, "recent_events"):
+            if getattr(self.collector, "provider_name", "") == "bilibili":
+                session_id = self.collector.live_session_id()
+                events = self.collector.store.recent_events(session_id, limit) if session_id else []
+                if session_id != self.collector.live_session_id():
+                    session_id, events = None, []
+                self._send_json({"events": events, "session_id": session_id, "data_source": "bilibili_websocket" if session_id else "none"})
+            elif hasattr(self.collector, "recent_events"):
                 events = self.collector.recent_events(limit)
+                status = self.collector.status()
+                session_id = status.get("session_id") if status.get("connected") else None
+                self._send_json({"events": events, "session_id": session_id, "data_source": "douyin_adapter" if session_id else "none"})
             else:
                 events = self.collector.store.recent_events(self.collector.data_session_id(), limit)
-            self._send_json({"events": events})
+                self._send_json({"events": events, "session_id": self.collector.data_session_id(), "data_source": "bilibili_websocket"})
             return
-        super().do_GET()
+        if not self._check_request_boundary():
+            return
+        self._serve_static()
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if not self._authorize_api(parsed.path):
+            return
         if parsed.path not in ("/api/connect", "/api/disconnect"):
-            self._send_json({"error": "not found"}, 404)
             return
         try:
-            length = min(safe_int(self.headers.get("Content-Length"), 0), 128 * 1024)
-            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            payload = self._read_json_body()
             if parsed.path == "/api/connect":
                 room_input = str(payload.get("url") or payload.get("room_id") or "").strip()
                 if not room_input:
@@ -862,12 +1551,16 @@ class AppHandler(SimpleHTTPRequestHandler):
                     self.collector.start(room_input, str(payload.get("sessdata") or ""))
                 self._send_json(self.collector.status(), 202)
             else:
-                self.collector.stop()
-                self._send_json(self.collector.status())
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            self._send_json({"error": f"invalid JSON: {error}"}, 400)
-        except Exception as error:
-            self._send_json({"error": str(error)}, 500)
+                stopped = self.collector.stop()
+                self._send_json(self.collector.status(), 200 if stopped else 202)
+        except BusyError:
+            self._send_json({"error": "previous collector run is still stopping", "status": self.collector.status()}, 409)
+        except RequestError as error:
+            self._send_json({"error": error.message}, error.status)
+        except (socket.timeout, TimeoutError):
+            self._send_json({"error": "request timeout"}, 408)
+        except Exception:
+            self._send_json({"error": "internal server error"}, 500)
 
 
 def run_self_test() -> None:
@@ -908,6 +1601,7 @@ def run_self_test() -> None:
         assert parse_business_event(json_bytes({"cmd": "DANMU_MSG", "info": [None, "hi", [12, "name"]]}))["uname"] == "name"
         collector = Collector(store)
         collector.session_id = session
+        collector.status_name = "connected"
         danmaku_packet = PacketCodec.pack(json_bytes({"cmd": "DANMU_MSG", "info": [None, "through collector", [12, "name"]]}), 5, 1)
         collector._handle_packet(PacketCodec.pack(__import__("zlib").compress(danmaku_packet), 5, 2))
         assert len(store.recent_events(session, 10)) == 2 and len(store.recent_snapshots(session, 10)) == 1
@@ -915,8 +1609,8 @@ def run_self_test() -> None:
         collector._handle_packet(online_packet)
         assert collector.online == 7 and collector.online_event_seen
         collector.session_id = None
-        collector.last_session_id = session
-        assert ("name", 1) in collector.metrics()["ranking"]
+        collector.status_name = "stopped"
+        assert collector.metrics()["ranking"] == []
         def varint(value: int) -> bytes:
             output = bytearray()
             while value > 127:
@@ -971,12 +1665,28 @@ def main() -> None:
     if args.self_test:
         run_self_test()
         return
+    database_lock = None
     if args.provider == "douyin":
         db_path = Path(":memory:") if args.mode == "demo" else Path(args.db)
-        collector = DouyinCollector(db_path, mode=args.mode)
+        if args.mode != "demo":
+            database_lock = acquire_database_lock(db_path.resolve())
+        try:
+            collector = DouyinCollector(db_path, mode=args.mode)
+        except Exception:
+            if database_lock is not None:
+                fcntl.flock(database_lock.fileno(), fcntl.LOCK_UN)
+                database_lock.close()
+            raise
     else:
-        collector = Collector(EventStore(Path(args.db)))
-    handler = type("BoundAppHandler", (AppHandler,), {"collector": collector})
+        db_path = Path(args.db).resolve()
+        database_lock = acquire_database_lock(db_path)
+        try:
+            collector = Collector(EventStore(db_path))
+        except Exception:
+            fcntl.flock(database_lock.fileno(), fcntl.LOCK_UN)
+            database_lock.close()
+            raise
+    handler = type("BoundAppHandler", (AppHandler,), {"collector": collector, "capability_token": secrets.token_urlsafe(32)})
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"Live Intelligence local service: http://127.0.0.1:{server.server_address[1]}/", flush=True)
     print(f"Provider: {args.provider} · mode: {args.mode}")
@@ -989,6 +1699,9 @@ def main() -> None:
         collector.stop()
         server.server_close()
         collector.store.close()
+        if database_lock is not None:
+            fcntl.flock(database_lock.fileno(), fcntl.LOCK_UN)
+            database_lock.close()
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ python3 server.py --mode demo
 .venv/bin/python douyin/server.py --mode auto
 ```
 
-首次运行先执行 `douyin/login.py`。它会打开抖音直播首页；请在该窗口完成扫码或手机号登录，然后关闭整个浏览器窗口。登录态只保存在本机 `douyin/data/browser-profile/`，该目录被 Git 忽略，不需要复制或发送 Cookie。采集器默认复用此登录目录并显示浏览器窗口。
+首次运行先执行 `douyin/login.py`。它会打开抖音直播首页；请在该窗口完成扫码或手机号登录，然后关闭整个浏览器窗口。登录态只保存在本机 `douyin/data/browser-profile/`，该目录被 Git 忽略，不需要复制或发送 Cookie。采集器默认复用此登录目录并显示浏览器窗口。这个持久 Profile 会保留浏览器登录态和 Cookie；它与页面中手工输入的 Cookie 只在服务进程内存中使用是两件事，停止采集不会自动清除 Profile。
 
 该 Profile 可能占用 100 MB 以上的本地空间，主要是可重建的 Chromium 缓存；Cookie 与登录状态本身很小。启动参数已把后续磁盘缓存限制在约 50 MB、媒体缓存限制在约 10 MB。目录不需要手工打开，只有登录失效时才重新运行 `login.py`；但采集期间浏览器引擎和目标直播页必须保持运行。当前抖音页面在本机 `headless` 模式会停止持续拉取事件，因此真实验收默认使用可见窗口，断开采集后窗口自动关闭。
 
@@ -65,19 +65,25 @@ DOUYIN_USER_AGENT="Mozilla/5.0 ... Chrome/148.0.0.0 Safari/537.36" \
 
 如果页面只停留在骨架页，采集器会返回明确错误，不再伪装成已连接；需要时可使用 `DOUYIN_HEADLESS=0` 和 `DOUYIN_PROFILE_DIR` 复用本机浏览器环境。
 
-Cookie 只在本地服务进程内存中使用，不写入 SQLite、日志或 `/api/status`；请自行遵守抖音服务条款、账号权限和适用法律法规。
+页面中手工输入的 Cookie 只在本地服务进程内存中使用，不写入 SQLite、日志或 `/api/status`；真实浏览器登录态仍由持久 Profile 保存。看板通过同源 `/api/bootstrap` 获取本次服务启动的浏览器调用边界令牌，并在内存中通过 `X-Bullet-Screen-Token` 调用 `/api/status`、`/api/metrics`、`/api/events`、`/api/connect` 和 `/api/disconnect`；该令牌用于同源/跨站请求和 CSRF 类防护，不是防御同机恶意程序的认证系统。令牌不放入 URL、SQLite 或日志。请自行遵守抖音服务条款、账号权限和适用法律法规。
 
 ## API
 
 ```bash
 curl http://127.0.0.1:4173/api/health
+curl http://127.0.0.1:4173/api/bootstrap
+# 将上一步响应中的浏览器调用边界 token 仅保存在当前终端变量，不要放入 URL 或日志
+TOKEN='<ephemeral token from same-origin /api/bootstrap>'
 curl -X POST http://127.0.0.1:4173/api/connect \
+  -H "X-Bullet-Screen-Token: $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://live.douyin.com/123456","mode":"demo"}'
-curl http://127.0.0.1:4173/api/status
-curl http://127.0.0.1:4173/api/metrics
-curl 'http://127.0.0.1:4173/api/events?limit=100'
-curl -X POST http://127.0.0.1:4173/api/disconnect -H 'Content-Type: application/json' -d '{}'
+curl -H "X-Bullet-Screen-Token: $TOKEN" http://127.0.0.1:4173/api/status
+curl -H "X-Bullet-Screen-Token: $TOKEN" http://127.0.0.1:4173/api/metrics
+curl -H "X-Bullet-Screen-Token: $TOKEN" 'http://127.0.0.1:4173/api/events?limit=100'
+curl -X POST http://127.0.0.1:4173/api/disconnect \
+  -H "X-Bullet-Screen-Token: $TOKEN" \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
 `/api/events` 的事件会包含 `event_id、room_id、timestamp、type、user、content、metadata、topic、intent、sentiment、purchase_intent`。当前分析为规则优先，分析器和 Store 都是可替换边界，后续可以接 LLM、Redis、PostgreSQL 或 SSE/WebSocket。

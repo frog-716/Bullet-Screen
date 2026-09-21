@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,6 +52,107 @@ STOP_WORDS = {
 }
 
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
+SCHEMA_VERSION = 3
+CORE_SCHEMA_TABLES = {"live_sessions", "live_events", "live_metric_snapshots", "capture_gaps"}
+SCHEMA_COLUMNS = {
+    "live_sessions": {
+        "id": ("INTEGER", 0, 1, None), "provider": ("TEXT", 1, 0, None),
+        "room_id": ("TEXT", 1, 0, None), "room_title": ("TEXT", 1, 0, None),
+        "room_url": ("TEXT", 1, 0, None), "started_at": ("TEXT", 1, 0, None),
+        "ended_at": ("TEXT", 0, 0, None), "status": ("TEXT", 1, 0, "'running'"),
+    },
+    "live_events": {
+        "id": ("INTEGER", 0, 1, None), "event_id": ("TEXT", 1, 0, None),
+        "session_id": ("INTEGER", 1, 0, None), "provider": ("TEXT", 1, 0, None),
+        "room_id": ("TEXT", 1, 0, None), "event_type": ("TEXT", 1, 0, None),
+        "event_time": ("TEXT", 1, 0, None), "user_id": ("TEXT", 0, 0, None),
+        "user_name": ("TEXT", 0, 0, None), "content": ("TEXT", 0, 0, None),
+        "metadata_json": ("TEXT", 0, 0, None), "topic": ("TEXT", 0, 0, None),
+        "intent": ("TEXT", 0, 0, None), "sentiment": ("TEXT", 0, 0, None),
+        "purchase_intent": ("TEXT", 0, 0, None),
+    },
+    "live_metric_snapshots": {
+        "id": ("INTEGER", 0, 1, None), "session_id": ("INTEGER", 1, 0, None),
+        "recorded_at": ("TEXT", 1, 0, None), "online": ("INTEGER", 0, 0, "0"),
+        "comment_rate": ("REAL", 0, 0, "0"), "like_rate": ("REAL", 0, 0, "0"),
+        "gift_rate": ("REAL", 0, 0, "0"), "active_users": ("INTEGER", 0, 0, "0"),
+        "heat_score": ("REAL", 0, 0, "0"), "purchase_ratio": ("REAL", 0, 0, "0"),
+        "positive_ratio": ("REAL", 0, 0, "0"), "negative_ratio": ("REAL", 0, 0, "0"),
+    },
+    "capture_gaps": {
+        "id": ("INTEGER", 0, 1, None), "provider": ("TEXT", 1, 0, None),
+        "room_id": ("TEXT", 1, 0, None), "session_id": ("INTEGER", 0, 0, None),
+        "run_id": ("TEXT", 0, 0, None), "gap_start": ("TEXT", 1, 0, None),
+        "gap_end": ("TEXT", 0, 0, None), "reason": ("TEXT", 1, 0, None),
+        "source": ("TEXT", 1, 0, "'collector'"), "status": ("TEXT", 1, 0, "'open'"),
+    },
+}
+SCHEMA_INDEXES = {
+    "idx_live_events_session_time": ("live_events", ("session_id", "event_time")),
+    "idx_live_events_type": ("live_events", ("session_id", "event_type")),
+    "idx_live_metrics_session_time": ("live_metric_snapshots", ("session_id", "recorded_at")),
+    "idx_capture_gaps_session_time": ("capture_gaps", ("session_id", "gap_start", "gap_end")),
+}
+
+
+class EventConflictError(ValueError):
+    """The same source event identity was reused for different event facts."""
+
+
+class SchemaVersionError(RuntimeError):
+    """The database is empty, unsupported, or requires an explicit migration."""
+
+
+def _schema_default(value: Any) -> Optional[str]:
+    return None if value is None else str(value).replace(" ", "").lower()
+
+
+def verify_schema_signature(connection: sqlite3.Connection) -> None:
+    tables = {
+        row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    missing_tables = CORE_SCHEMA_TABLES - tables
+    unexpected_tables = tables - CORE_SCHEMA_TABLES
+    if missing_tables or unexpected_tables:
+        raise SchemaVersionError(
+            f"Douyin schema signature mismatch: missing={sorted(missing_tables)}, unexpected={sorted(unexpected_tables)}"
+        )
+    for table, required in SCHEMA_COLUMNS.items():
+        actual = {
+            row[1]: (str(row[2]).upper(), int(row[3]), int(row[5]), _schema_default(row[4]))
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for name, expected in required.items():
+            if name not in actual or actual[name] != expected:
+                raise SchemaVersionError(f"Douyin schema signature mismatch in {table}.{name}")
+    for index_name, (table, expected_columns) in SCHEMA_INDEXES.items():
+        index_row = next(
+            (row for row in connection.execute(f"PRAGMA index_list({table})") if row[1] == index_name),
+            None,
+        )
+        if not index_row:
+            raise SchemaVersionError(f"Douyin schema signature missing index {index_name}")
+        actual_columns = tuple(row[2] for row in connection.execute(f"PRAGMA index_info({index_name})"))
+        if actual_columns != expected_columns:
+            raise SchemaVersionError(f"Douyin schema signature mismatch in index {index_name}")
+    unique_event_id = any(
+        int(row[2]) == 1 and tuple(item[2] for item in connection.execute(f"PRAGMA index_info({row[1]})")) == ("event_id",)
+        for row in connection.execute("PRAGMA index_list(live_events)")
+    )
+    if not unique_event_id:
+        raise SchemaVersionError("Douyin schema signature missing unique live_events.event_id")
+    expected_foreign_keys = {
+        "live_sessions": set(),
+        "live_events": {("live_sessions", "session_id", "id")},
+        "live_metric_snapshots": {("live_sessions", "session_id", "id")},
+        "capture_gaps": {("live_sessions", "session_id", "id")},
+    }
+    for table, expected in expected_foreign_keys.items():
+        actual = {(row[2], row[3], row[4]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")}
+        if actual != expected:
+            raise SchemaVersionError(f"Douyin schema signature mismatch in foreign keys for {table}")
 
 
 def utc_now() -> str:
@@ -85,7 +187,17 @@ def event_seconds(value: Any) -> float:
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError, OverflowError):
-        return time.time()
+        return float("-inf")
+
+
+def parse_utc_timestamp(value: Any) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _clean_text(value: Any, limit: int = 500) -> str:
@@ -183,6 +295,7 @@ def normalize_event(
     }
     return {
         "event_id": identity,
+        "source_event_id": explicit_id,
         "provider": str(provider or "unknown"),
         "room_id": str(room_id),
         "timestamp": event_time,
@@ -198,13 +311,49 @@ def normalize_event(
 class LiveEventStore:
     """SQLite store for the Douyin subproject's normalized events and metrics."""
 
+    SCHEMA_VERSION = SCHEMA_VERSION
+    SchemaVersionError = SchemaVersionError
+
     def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(path), check_same_thread=False)
+        path_text = str(path)
+        if path_text != ":memory:":
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path_text, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("PRAGMA busy_timeout=5000")
+        try:
+            self._ensure_schema()
+        except Exception:
+            self.connection.close()
+            raise
+        self._reconcile_interrupted_sessions()
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
+
+    def _ensure_schema(self) -> None:
+        version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+        tables = {
+            row[0] for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        expected_tables = {"live_sessions", "live_events", "live_metric_snapshots", "capture_gaps"}
+        if tables and version != self.SCHEMA_VERSION:
+            raise SchemaVersionError(f"Douyin database schema {version} requires an explicit migration to {self.SCHEMA_VERSION}")
+        if tables and not expected_tables.issubset(tables):
+            raise SchemaVersionError("Douyin database schema is incomplete; refusing to write")
+        if version > self.SCHEMA_VERSION:
+            raise SchemaVersionError(f"Douyin database schema {version} is newer than supported {self.SCHEMA_VERSION}")
+        if version != 0 and not tables:
+            raise SchemaVersionError(f"Douyin database schema {version} has no matching schema; refusing to write")
+        if version == self.SCHEMA_VERSION and not tables:
+            raise SchemaVersionError("database declares a schema version but has no tables")
+        if tables:
+            verify_schema_signature(self.connection)
+            return
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS live_sessions(
@@ -250,12 +399,35 @@ class LiveEventStore:
               negative_ratio REAL DEFAULT 0,
               FOREIGN KEY(session_id) REFERENCES live_sessions(id)
             );
+            CREATE TABLE IF NOT EXISTS capture_gaps(
+              id INTEGER PRIMARY KEY,
+              provider TEXT NOT NULL,
+              room_id TEXT NOT NULL,
+              session_id INTEGER,
+              run_id TEXT,
+              gap_start TEXT NOT NULL,
+              gap_end TEXT,
+              reason TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT 'collector',
+              status TEXT NOT NULL DEFAULT 'open',
+              FOREIGN KEY(session_id) REFERENCES live_sessions(id)
+            );
             CREATE INDEX IF NOT EXISTS idx_live_events_session_time ON live_events(session_id, event_time);
             CREATE INDEX IF NOT EXISTS idx_live_events_type ON live_events(session_id, event_type);
             CREATE INDEX IF NOT EXISTS idx_live_metrics_session_time ON live_metric_snapshots(session_id, recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_capture_gaps_session_time ON capture_gaps(session_id, gap_start, gap_end);
             """
         )
+        self.connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
         self.connection.commit()
+
+    def _reconcile_interrupted_sessions(self) -> None:
+        with self.lock:
+            self.connection.execute(
+                "UPDATE live_sessions SET ended_at=COALESCE(ended_at, ?), status='interrupted' WHERE status='running'",
+                (utc_now(),),
+            )
+            self.connection.commit()
 
     def start_session(self, provider: str, room_id: str, title: str, url: str) -> int:
         with self.lock:
@@ -273,15 +445,42 @@ class LiveEventStore:
 
     def insert_event(self, session_id: int, event: Dict[str, Any]) -> bool:
         analysis = event.get("analysis") or {}
-        metadata = event.get("metadata") or {}
+        metadata = dict(event.get("metadata") or {})
+        metadata["_analysis"] = {
+            "version": "rules-v1",
+            "is_question": analysis.get("is_question", "false"),
+        }
+        source_event_id = str(event.get("source_event_id") or "")
+        if source_event_id:
+            metadata["_source_event_id"] = source_event_id
+        if source_event_id:
+            storage_event_id = ":".join(
+                (str(event.get("provider") or "unknown"), str(event.get("room_id") or ""), str(session_id), source_event_id)
+            )
+        else:
+            storage_event_id = f"observation:{uuid.uuid4().hex}"
+        fingerprint = (
+            str(event.get("provider") or "unknown"), str(event.get("room_id") or ""),
+            str(event.get("type") or "unknown"), str(event.get("user_id") or ""),
+            str(event.get("user_name") or ""), str(event.get("content") or ""),
+        )
         with self.lock:
+            existing = self.connection.execute(
+                "SELECT provider,room_id,event_type,user_id,user_name,content FROM live_events WHERE event_id=?",
+                (storage_event_id,),
+            ).fetchone()
+            if existing:
+                existing_fingerprint = tuple(str(existing[key] or "") for key in ("provider", "room_id", "event_type", "user_id", "user_name", "content"))
+                if existing_fingerprint != fingerprint:
+                    raise EventConflictError(f"conflicting facts for source event {source_event_id}")
+                return False
             cursor = self.connection.execute(
-                """INSERT OR IGNORE INTO live_events(
+                """INSERT INTO live_events(
                 event_id,session_id,provider,room_id,event_type,event_time,user_id,user_name,
                 content,metadata_json,topic,intent,sentiment,purchase_intent)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    event.get("event_id"), session_id, event.get("provider", "douyin"), event.get("room_id", ""),
+                    storage_event_id, session_id, event.get("provider", "douyin"), event.get("room_id", ""),
                     event.get("type", "unknown"), event.get("timestamp") or utc_now(),
                     event.get("user_id"), event.get("user_name"), event.get("content"),
                     json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), analysis.get("topic"),
@@ -298,7 +497,7 @@ class LiveEventStore:
                 session_id,recorded_at,online,comment_rate,like_rate,gift_rate,active_users,heat_score,
                 purchase_ratio,positive_ratio,negative_ratio) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    session_id, utc_now(), safe_int(metrics.get("online")), metrics.get("comment_rate", 0),
+                    session_id, utc_now(), None if metrics.get("online") is None else safe_int(metrics.get("online")), metrics.get("comment_rate", 0),
                     metrics.get("like_rate", 0), metrics.get("gift_rate", 0), safe_int(metrics.get("active_users")),
                     metrics.get("heat_score", 0), metrics.get("purchase_ratio", 0), metrics.get("positive_ratio", 0),
                     metrics.get("negative_ratio", 0),
@@ -314,8 +513,21 @@ class LiveEventStore:
             metadata = json.loads(row["metadata_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
             metadata = {}
+        stored_analysis = metadata.get("_analysis") if isinstance(metadata.get("_analysis"), dict) else {}
+        is_question = stored_analysis.get("is_question")
+        if is_question not in {"true", "false"}:
+            is_question = analyze_text(row["content"] or "").get("is_question", "false") if row["event_type"] == "comment" else "false"
+        value_contract = None
+        if row["event_type"] == "gift":
+            value_contract = {
+                "quantity": metadata.get("gift_count"), "quantity_unit": "item",
+                "raw_platform_value": metadata.get("platform_amount"), "currency": metadata.get("currency"),
+                "estimated_value": metadata.get("estimated_value"), "estimated": bool(metadata.get("estimated", False)),
+                "value_semantics": metadata.get("value_semantics", "unknown"),
+            }
         return {
             "event_id": row["event_id"], "provider": row["provider"], "room_id": row["room_id"],
+            "source_event_id": metadata.get("_source_event_id", ""),
             "timestamp": timestamp, "event_time": timestamp, "timestamp_utc": timestamp_utc,
             "type": row["event_type"], "event_type": row["event_type"],
             "user": {"id": row["user_id"] or "", "name": row["user_name"] or "匿名用户"},
@@ -323,21 +535,33 @@ class LiveEventStore:
             "content": row["content"] or "", "text": row["content"] or "", "metadata": metadata,
             "topic": row["topic"] or "other", "intent": row["intent"] or "small_talk",
             "sentiment": row["sentiment"] or "neutral", "purchase_intent": row["purchase_intent"] or "low",
+            "is_question": is_question,
             "analysis": {
                 "topic": row["topic"] or "other", "intent": row["intent"] or "small_talk",
-                "sentiment": row["sentiment"] or "neutral", "purchase_intent": row["purchase_intent"] or "low",
+                "sentiment": row["sentiment"] or "neutral", "purchase_intent": row["purchase_intent"] or "low", "is_question": is_question,
             },
+            "value_contract": value_contract,
         }
 
-    def recent_events(self, session_id: Optional[int], limit: int = 200) -> List[Dict[str, Any]]:
-        limit = min(max(safe_int(limit, 200), 1), 1000)
+    def recent_events(self, session_id: Optional[int], limit: Optional[int] = 200, since: Optional[str] = None) -> List[Dict[str, Any]]:
+        limit_sql = ""
+        limit_value: Optional[int] = None
+        if limit is not None:
+            limit_value = min(max(safe_int(limit, 200), 1), 1000)
         with self.lock:
+            clauses: List[str] = []
+            params: List[Any] = []
             if session_id:
-                rows = self.connection.execute(
-                    "SELECT * FROM live_events WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit)
-                ).fetchall()
-            else:
-                rows = self.connection.execute("SELECT * FROM live_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+                clauses.append("session_id=?")
+                params.append(session_id)
+            if since:
+                clauses.append("event_time>=?")
+                params.append(since)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            if limit_value is not None:
+                limit_sql = " LIMIT ?"
+                params.append(limit_value)
+            rows = self.connection.execute(f"SELECT * FROM live_events{where} ORDER BY id DESC{limit_sql}", params).fetchall()
         return [self._row_to_event(row) for row in reversed(rows)]
 
     def recent_snapshots(self, session_id: Optional[int], limit: int = 60) -> List[Dict[str, Any]]:
@@ -362,6 +586,99 @@ class LiveEventStore:
             result.append(item)
         return result
 
+    def open_gap(
+        self,
+        provider: str,
+        room_id: str,
+        session_id: Optional[int],
+        run_id: Optional[str],
+        reason: str,
+        started_at: Optional[str] = None,
+        source: str = "collector",
+    ) -> int:
+        with self.lock:
+            if session_id is not None and not self.connection.execute("SELECT 1 FROM live_sessions WHERE id=?", (session_id,)).fetchone():
+                return 0
+            existing = self.connection.execute(
+                """SELECT id FROM capture_gaps
+                WHERE provider=? AND room_id=? AND session_id IS ? AND run_id IS ?
+                  AND reason=? AND status='open' ORDER BY id DESC LIMIT 1""",
+                (provider, room_id, session_id, run_id, reason),
+            ).fetchone()
+            if existing:
+                return int(existing[0])
+            cursor = self.connection.execute(
+                """INSERT INTO capture_gaps(provider,room_id,session_id,run_id,gap_start,reason,source,status)
+                VALUES(?,?,?,?,?,?,?,'open')""",
+                (provider, room_id, session_id, run_id, started_at or utc_now(), reason, source),
+            )
+            self.connection.commit()
+            return int(cursor.lastrowid)
+
+    def close_gap(self, gap_id: int, ended_at: Optional[str] = None) -> bool:
+        with self.lock:
+            cursor = self.connection.execute(
+                "UPDATE capture_gaps SET gap_end=?, status='closed' WHERE id=? AND status='open'",
+                (ended_at or utc_now(), gap_id),
+            )
+            self.connection.commit()
+            return cursor.rowcount == 1
+
+    def close_open_gaps(self, session_id: int, run_id: Optional[str] = None, ended_at: Optional[str] = None) -> int:
+        with self.lock:
+            if run_id is None:
+                cursor = self.connection.execute(
+                    "UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND status='open'",
+                    (ended_at or utc_now(), session_id),
+                )
+            else:
+                cursor = self.connection.execute(
+                    "UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND run_id=? AND status='open'",
+                    (ended_at or utc_now(), session_id, run_id),
+                )
+            self.connection.commit()
+            return cursor.rowcount
+
+    def gaps(self, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        with self.lock:
+            if session_id is None:
+                rows = self.connection.execute("SELECT * FROM capture_gaps ORDER BY id").fetchall()
+            else:
+                rows = self.connection.execute("SELECT * FROM capture_gaps WHERE session_id=? ORDER BY id", (session_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def coverage(self, session_id: int, start: str, end: str) -> Dict[str, Any]:
+        start_dt = parse_utc_timestamp(start)
+        end_dt = parse_utc_timestamp(end)
+        if start_dt is None or end_dt is None or end_dt <= start_dt:
+            raise ValueError("coverage window must contain valid ordered timestamps")
+        rows = [
+            gap for gap in self.gaps(session_id)
+            if (gap_start := parse_utc_timestamp(gap["gap_start"])) is not None
+            and gap_start < end_dt
+            and (gap["gap_end"] is None or (gap_end := parse_utc_timestamp(gap["gap_end"])) is None or gap_end > start_dt)
+        ]
+        with self.lock:
+            event_times = [row[0] for row in self.connection.execute("SELECT event_time FROM live_events WHERE session_id=?", (session_id,))]
+            snapshot_times = [row[0] for row in self.connection.execute("SELECT recorded_at FROM live_metric_snapshots WHERE session_id=?", (session_id,))]
+        event_count = sum(1 for value in event_times if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt)
+        snapshot_count = sum(1 for value in snapshot_times if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt)
+        if rows:
+            coverage_state = "gap"
+        elif event_count:
+            coverage_state = "reliable_with_data"
+        elif snapshot_count:
+            coverage_state = "reliable_no_events"
+        else:
+            coverage_state = "unknown"
+        return {
+            "session_id": session_id, "start": start, "end": end,
+            "coverage_state": coverage_state,
+            "complete": coverage_state in {"reliable_with_data", "reliable_no_events"},
+            "has_open_gap": any(gap["gap_end"] is None for gap in rows),
+            "event_count": event_count, "snapshot_count": snapshot_count, "gaps": rows,
+        }
+
     def close(self) -> None:
         with self.lock:
             self.connection.close()
@@ -384,7 +701,7 @@ class SignalEngine:
     def _ratio(count: int, total: int) -> float:
         return round(count / total, 3) if total else 0.0
 
-    def build(self, events: Sequence[Dict[str, Any]], online: int = 0, snapshots: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def build(self, events: Sequence[Dict[str, Any]], online: Optional[int] = None, snapshots: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
         recent = list(events)
         windows: Dict[str, Dict[str, Any]] = {}
         for seconds, label in ((10, "10s"), (60, "60s"), (300, "5m")):

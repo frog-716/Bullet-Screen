@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
     private var outputBuffer = ""
+    private let maxOutputBufferCharacters = 64 * 1024
     private var currentPort: Int?
     private var projectRoot: URL?
 
@@ -227,6 +228,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func consumeServerOutput(_ text: String, provider: String) {
         outputBuffer += text
+        if outputBuffer.count > maxOutputBufferCharacters {
+            outputBuffer = String(outputBuffer.suffix(maxOutputBufferCharacters))
+        }
         while let newline = outputBuffer.firstIndex(of: "\n") {
             let line = String(outputBuffer[..<newline]).trimmingCharacters(in: .whitespacesAndNewlines)
             outputBuffer = String(outputBuffer[outputBuffer.index(after: newline)...])

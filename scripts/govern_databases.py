@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Govern the two local SQLite stores without losing historical live data.
 
-The migration removes fields that no current reader uses and moves the
-legacy normalized Douyin tables out of the Bilibili database. It is explicit:
-without --apply it only reports what would change.
+The migration is explicit: without ``--apply`` it only reports what would
+change. Apply always retains source tables; any later cleanup is a separate
+approved operation after independent verification.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
+import json
+import os
+import shutil
 import sqlite3
-import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -19,6 +23,15 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BILIBILI_DB = ROOT / "bilibili" / "data" / "danmaku.sqlite3"
 DEFAULT_DOUYIN_DB = ROOT / "douyin" / "data" / "danmaku.sqlite3"
 LEGACY_LIVE_TABLES = ("live_metric_snapshots", "live_events", "live_sessions")
+SCHEMA_VERSION = 3
+
+
+class MigrationConflict(RuntimeError):
+    """A source row and an existing target row share an identity but differ."""
+
+
+class RehearsalFailure(RuntimeError):
+    """Synthetic failure injected into an isolated migration rehearsal."""
 
 
 def table_exists(connection: sqlite3.Connection, table: str) -> bool:
@@ -30,20 +43,324 @@ def columns(connection: sqlite3.Connection, table: str) -> List[str]:
 
 
 def connect(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        raise FileNotFoundError(f"database does not exist: {path}")
     connection = sqlite3.connect(str(path))
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA busy_timeout=5000")
     return connection
 
 
 def backup(connection: sqlite3.Connection, destination: Path) -> None:
+    if destination.exists():
+        raise FileExistsError(f"backup destination already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     target = sqlite3.connect(str(destination))
     try:
         connection.backup(target)
     finally:
         target.close()
+
+
+def _acquire_database_lock(path: Path):
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise RuntimeError(f"database is already in use: {path}") from error
+    return handle
+
+
+def _copy_database_snapshot(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    for suffix in ("-wal", "-shm"):
+        source_sidecar = source.with_name(source.name + suffix)
+        if source_sidecar.exists():
+            shutil.copy2(source_sidecar, destination.with_name(destination.name + suffix))
+
+
+def database_signature(connection: sqlite3.Connection) -> Dict[str, Tuple[int, str]]:
+    signature: Dict[str, Tuple[int, str]] = {}
+    tables = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    for row in tables:
+        table = row[0]
+        digest = hashlib.sha256()
+        count = 0
+        for values in connection.execute(f"SELECT * FROM {table} ORDER BY rowid"):
+            digest.update(repr(tuple(values)).encode("utf-8"))
+            digest.update(b"\n")
+            count += 1
+        signature[table] = (count, digest.hexdigest())
+    return signature
+
+
+def _verify_table_columns(connection: sqlite3.Connection, table: str, required: Iterable[str]) -> None:
+    actual = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    missing = set(required) - actual
+    if missing:
+        raise RuntimeError(f"schema verification failed for {table}: missing {sorted(missing)}")
+
+
+def _verify_index(connection: sqlite3.Connection, table: str, name: str, expected_columns: Tuple[str, ...]) -> None:
+    index_row = next((row for row in connection.execute(f"PRAGMA index_list({table})") if row[1] == name), None)
+    if not index_row:
+        raise RuntimeError(f"schema verification failed: missing index {name}")
+    actual_columns = tuple(row[2] for row in connection.execute(f"PRAGMA index_info({name})"))
+    if actual_columns != expected_columns:
+        raise RuntimeError(f"schema verification failed: index {name} has {actual_columns}")
+
+
+def verify_schema_structure(connection: sqlite3.Connection) -> None:
+    tables = {
+        row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if {"sessions", "events", "metric_snapshots", "capture_gaps"}.issubset(tables):
+        required_columns = {
+            "sessions": ("id", "room_id", "room_title", "started_at", "ended_at", "status"),
+            "events": ("id", "session_id", "event_type", "event_time", "uid", "uname", "text", "gift_name", "gift_num", "amount", "popularity"),
+            "metric_snapshots": ("id", "session_id", "recorded_at", "online", "likes", "danmaku_rate", "total_danmaku"),
+            "capture_gaps": ("id", "provider", "room_id", "session_id", "run_id", "gap_start", "gap_end", "reason", "source", "status"),
+        }
+        indexes = (
+            ("events", "idx_events_session_time", ("session_id", "event_time")),
+            ("events", "idx_events_type", ("session_id", "event_type")),
+            ("metric_snapshots", "idx_metrics_session_time", ("session_id", "recorded_at")),
+            ("capture_gaps", "idx_capture_gaps_session_time", ("session_id", "gap_start", "gap_end")),
+        )
+        foreign_key_tables = ("events", "metric_snapshots", "capture_gaps")
+    elif {"live_sessions", "live_events", "live_metric_snapshots", "capture_gaps"}.issubset(tables):
+        required_columns = {
+            "live_sessions": ("id", "provider", "room_id", "room_title", "room_url", "started_at", "ended_at", "status"),
+            "live_events": ("id", "event_id", "session_id", "provider", "room_id", "event_type", "event_time", "user_id", "user_name", "content", "metadata_json", "topic", "intent", "sentiment", "purchase_intent"),
+            "live_metric_snapshots": ("id", "session_id", "recorded_at", "online", "comment_rate", "like_rate", "gift_rate", "active_users", "heat_score", "purchase_ratio", "positive_ratio", "negative_ratio"),
+            "capture_gaps": ("id", "provider", "room_id", "session_id", "run_id", "gap_start", "gap_end", "reason", "source", "status"),
+        }
+        indexes = (
+            ("live_events", "idx_live_events_session_time", ("session_id", "event_time")),
+            ("live_events", "idx_live_events_type", ("session_id", "event_type")),
+            ("live_metric_snapshots", "idx_live_metrics_session_time", ("session_id", "recorded_at")),
+            ("capture_gaps", "idx_capture_gaps_session_time", ("session_id", "gap_start", "gap_end")),
+        )
+        foreign_key_tables = ("live_events", "live_metric_snapshots", "capture_gaps")
+        unique_event_id = any(
+            int(row[2]) == 1 and tuple(item[2] for item in connection.execute(f"PRAGMA index_info({row[1]})")) == ("event_id",)
+            for row in connection.execute("PRAGMA index_list(live_events)")
+        )
+        if not unique_event_id:
+            raise RuntimeError("schema verification failed: live_events.event_id is not unique")
+    elif set(LEGACY_LIVE_TABLES).issubset(tables):
+        return verify_schema_structure_for_legacy(connection)
+    else:
+        raise RuntimeError(f"schema verification failed: unsupported tables {sorted(tables)}")
+    for table, required in required_columns.items():
+        _verify_table_columns(connection, table, required)
+    for table, name, expected_columns in indexes:
+        _verify_index(connection, table, name, expected_columns)
+    session_table = "sessions" if "sessions" in tables else "live_sessions"
+    expected_foreign_keys = {
+        "events": ("sessions", "session_id", "id"),
+        "metric_snapshots": ("sessions", "session_id", "id"),
+        "capture_gaps": (session_table, "session_id", "id"),
+        "live_events": ("live_sessions", "session_id", "id"),
+        "live_metric_snapshots": ("live_sessions", "session_id", "id"),
+    }
+    for table in foreign_key_tables:
+        actual = {(row[2], row[3], row[4]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")}
+        expected = {expected_foreign_keys[table]}
+        if actual != expected:
+            raise RuntimeError(f"schema verification failed: foreign keys for {table} are {actual}")
+
+
+def verify_schema_structure_for_legacy(connection: sqlite3.Connection) -> None:
+    required_columns = {
+        "live_sessions": ("id", "provider", "room_id", "room_title", "room_url", "started_at", "ended_at", "status"),
+        "live_events": ("id", "event_id", "session_id", "provider", "room_id", "event_type", "event_time", "user_id", "user_name", "content", "metadata_json", "topic", "intent", "sentiment", "purchase_intent"),
+        "live_metric_snapshots": ("id", "session_id", "recorded_at", "online", "comment_rate", "like_rate", "gift_rate", "active_users", "heat_score", "purchase_ratio", "positive_ratio", "negative_ratio"),
+    }
+    for table, required in required_columns.items():
+        _verify_table_columns(connection, table, required)
+
+
+def verify_integrity(connection: sqlite3.Connection) -> None:
+    integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+    if integrity != "ok":
+        raise RuntimeError(f"integrity_check failed: {integrity}")
+    foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_key_errors:
+        raise RuntimeError(f"foreign_key_check failed: {foreign_key_errors[:3]}")
+
+
+def verify_database(connection: sqlite3.Connection) -> None:
+    verify_integrity(connection)
+    verify_schema_structure(connection)
+
+
+def verify_backup(source: sqlite3.Connection, destination: Path) -> None:
+    target = connect(destination)
+    try:
+        verify_integrity(target)
+        if database_signature(source) != database_signature(target):
+            raise RuntimeError(f"backup verification failed: {destination}")
+    finally:
+        target.close()
+
+
+def create_capture_gap_schema(connection: sqlite3.Connection, session_table: str) -> None:
+    if session_table not in {"sessions", "live_sessions"}:
+        raise ValueError(f"unsupported session table: {session_table}")
+    connection.executescript(
+        f"""CREATE TABLE IF NOT EXISTS capture_gaps(
+          id INTEGER PRIMARY KEY, provider TEXT NOT NULL, room_id TEXT NOT NULL,
+          session_id INTEGER, run_id TEXT, gap_start TEXT NOT NULL, gap_end TEXT,
+          reason TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'collector',
+          status TEXT NOT NULL DEFAULT 'open',
+          FOREIGN KEY(session_id) REFERENCES {session_table}(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_capture_gaps_session_time
+          ON capture_gaps(session_id, gap_start, gap_end);"""
+    )
+    connection.commit()
+
+
+def _fail_if_requested(fail_stage: str | None, stage: str) -> None:
+    if fail_stage == stage:
+        raise RehearsalFailure(stage)
+
+
+def _write_manifest(path: Path, payload: Dict[str, object]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def rehearse_migration(
+    bilibili_path: Path,
+    douyin_path: Path,
+    workspace: Path,
+    fail_stage: str | None = None,
+) -> Dict[str, object]:
+    """Copy, verify, migrate, verify, and atomically switch only a rehearsal manifest."""
+
+    bilibili_path = Path(bilibili_path)
+    douyin_path = Path(douyin_path)
+    workspace = Path(workspace)
+    if not bilibili_path.exists() or not douyin_path.exists():
+        missing = bilibili_path if not bilibili_path.exists() else douyin_path
+        raise FileNotFoundError(f"database does not exist: {missing}")
+    if workspace.exists() and any(workspace.iterdir()):
+        raise FileExistsError(f"rehearsal workspace is not empty: {workspace}")
+    workspace.mkdir(parents=True, exist_ok=True)
+    backup_dir = workspace / "backup"
+    staging_dir = workspace / "staging"
+    switch_dir = workspace / "switch"
+    backup_dir.mkdir()
+    staging_dir.mkdir()
+    switch_dir.mkdir()
+
+    source_dir = workspace / "source"
+    source_dir.mkdir()
+    source_locks = []
+    source_bilibili = None
+    source_douyin = None
+    try:
+        for source_path in (bilibili_path, douyin_path):
+            source_locks.append(_acquire_database_lock(source_path))
+        source_bilibili_path = source_dir / "bilibili.sqlite3"
+        source_douyin_path = source_dir / "douyin.sqlite3"
+        _copy_database_snapshot(bilibili_path, source_bilibili_path)
+        _copy_database_snapshot(douyin_path, source_douyin_path)
+        source_bilibili = connect(source_bilibili_path)
+        source_douyin = connect(source_douyin_path)
+        backup(source_bilibili, backup_dir / "bilibili.sqlite3")
+        backup(source_douyin, backup_dir / "douyin.sqlite3")
+        backup_bilibili = backup_dir / "bilibili.sqlite3"
+        backup_douyin = backup_dir / "douyin.sqlite3"
+        verify_backup(source_bilibili, backup_bilibili)
+        verify_backup(source_douyin, backup_douyin)
+        backup(source_bilibili, staging_dir / "bilibili.sqlite3")
+        backup(source_douyin, staging_dir / "douyin.sqlite3")
+    finally:
+        if source_bilibili is not None:
+            source_bilibili.close()
+        if source_douyin is not None:
+            source_douyin.close()
+        for lock in reversed(source_locks):
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+    _fail_if_requested(fail_stage, "copy")
+
+    staged_bilibili = connect(staging_dir / "bilibili.sqlite3")
+    staged_douyin = connect(staging_dir / "douyin.sqlite3")
+    try:
+        verify_database(staged_bilibili)
+        verify_database(staged_douyin)
+    finally:
+        staged_bilibili.close()
+        staged_douyin.close()
+    _fail_if_requested(fail_stage, "verify-before")
+
+    staged_bilibili = connect(staging_dir / "bilibili.sqlite3")
+    staged_douyin = connect(staging_dir / "douyin.sqlite3")
+    try:
+        create_douyin_schema(staged_douyin)
+        create_capture_gap_schema(staged_bilibili, "sessions" if table_exists(staged_bilibili, "sessions") else "live_sessions")
+        rebuild_douyin_events(staged_douyin, True)
+        legacy_counts = migrate_legacy_live(staged_bilibili, staged_douyin, True)
+        bilibili_events = rebuild_bilibili_events(staged_bilibili, True)
+        staged_bilibili.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        staged_douyin.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        staged_bilibili.commit()
+        staged_douyin.commit()
+    finally:
+        staged_bilibili.close()
+        staged_douyin.close()
+    _fail_if_requested(fail_stage, "migration")
+
+    staged_bilibili = connect(staging_dir / "bilibili.sqlite3")
+    staged_douyin = connect(staging_dir / "douyin.sqlite3")
+    try:
+        verify_database(staged_bilibili)
+        verify_database(staged_douyin)
+        staged_signatures = {
+            "bilibili": database_signature(staged_bilibili),
+            "douyin": database_signature(staged_douyin),
+        }
+    finally:
+        staged_bilibili.close()
+        staged_douyin.close()
+    _fail_if_requested(fail_stage, "verify-after")
+
+    _fail_if_requested(fail_stage, "switch-before")
+    manifest = switch_dir / "active.json"
+    temporary_payload = {
+        "status": "ready",
+        "schema_version": SCHEMA_VERSION,
+        "backup": {"bilibili": str(backup_bilibili), "douyin": str(backup_douyin)},
+        "candidate": {"bilibili": str(staging_dir / "bilibili.sqlite3"), "douyin": str(staging_dir / "douyin.sqlite3")},
+        "signatures": staged_signatures,
+        "legacy_counts": legacy_counts,
+        "bilibili_events_rebuilt": bilibili_events,
+    }
+    temporary_manifest = manifest.with_suffix(manifest.suffix + ".tmp")
+    with temporary_manifest.open("w", encoding="utf-8") as stream:
+        json.dump(temporary_payload, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    _fail_if_requested(fail_stage, "switch")
+    os.replace(temporary_manifest, manifest)
+    return {"status": "switched-simulation", "switch_manifest": str(manifest), "workspace": str(workspace)}
 
 
 def rebuild_bilibili_events(connection: sqlite3.Connection, apply: bool) -> bool:
@@ -105,9 +422,16 @@ def create_douyin_schema(connection: sqlite3.Connection) -> None:
           purchase_ratio REAL DEFAULT 0, positive_ratio REAL DEFAULT 0,
           negative_ratio REAL DEFAULT 0, FOREIGN KEY(session_id) REFERENCES live_sessions(id)
         );
+        CREATE TABLE IF NOT EXISTS capture_gaps(
+          id INTEGER PRIMARY KEY, provider TEXT NOT NULL, room_id TEXT NOT NULL,
+          session_id INTEGER, run_id TEXT, gap_start TEXT NOT NULL, gap_end TEXT,
+          reason TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'collector',
+          status TEXT NOT NULL DEFAULT 'open', FOREIGN KEY(session_id) REFERENCES live_sessions(id)
+        );
         CREATE INDEX IF NOT EXISTS idx_live_events_session_time ON live_events(session_id, event_time);
         CREATE INDEX IF NOT EXISTS idx_live_events_type ON live_events(session_id, event_type);
-        CREATE INDEX IF NOT EXISTS idx_live_metrics_session_time ON live_metric_snapshots(session_id, recorded_at);"""
+        CREATE INDEX IF NOT EXISTS idx_live_metrics_session_time ON live_metric_snapshots(session_id, recorded_at);
+        CREATE INDEX IF NOT EXISTS idx_capture_gaps_session_time ON capture_gaps(session_id, gap_start, gap_end);"""
     )
     connection.commit()
 
@@ -163,10 +487,17 @@ def migrate_legacy_live(source: sqlite3.Connection, target: sqlite3.Connection, 
     session_map: Dict[int, int] = {}
     for row in source.execute("SELECT id,provider,room_id,room_title,room_url,started_at,ended_at,status FROM live_sessions ORDER BY id"):
         existing = target.execute(
-            "SELECT id FROM live_sessions WHERE provider=? AND room_id=? AND started_at=?",
+            """SELECT id,provider,room_id,room_title,room_url,started_at,ended_at,status
+            FROM live_sessions WHERE provider=? AND room_id=? AND started_at=?""",
             (row["provider"], row["room_id"], row["started_at"]),
         ).fetchone()
         if existing:
+            expected_session = tuple(row[key] for key in ("provider", "room_id", "room_title", "room_url", "started_at", "ended_at", "status"))
+            actual_session = tuple(existing[key] for key in ("provider", "room_id", "room_title", "room_url", "started_at", "ended_at", "status"))
+            if actual_session != expected_session:
+                raise MigrationConflict(
+                    f"conflicting live_sessions identity: {row['provider']}:{row['room_id']}:{row['started_at']}"
+                )
             session_map[row["id"]] = int(existing[0])
             continue
         cursor = target.execute(
@@ -181,7 +512,19 @@ def migrate_legacy_live(source: sqlite3.Connection, target: sqlite3.Connection, 
         """SELECT event_id,session_id,provider,room_id,event_type,event_time,user_id,user_name,content,
         metadata_json,topic,intent,sentiment,purchase_intent FROM live_events ORDER BY id"""
     ):
-        if target.execute("SELECT 1 FROM live_events WHERE event_id=?", (row["event_id"],)).fetchone():
+        existing = target.execute(
+            """SELECT session_id,provider,room_id,event_type,event_time,user_id,user_name,content,
+            metadata_json,topic,intent,sentiment,purchase_intent FROM live_events WHERE event_id=?""",
+            (row["event_id"],),
+        ).fetchone()
+        expected = (
+            session_map[row["session_id"]], row["provider"], row["room_id"], row["event_type"], row["event_time"],
+            row["user_id"], row["user_name"], row["content"], row["metadata_json"], row["topic"], row["intent"],
+            row["sentiment"], row["purchase_intent"],
+        )
+        if existing:
+            if tuple(existing) != expected:
+                raise MigrationConflict(f"conflicting live_events.event_id: {row['event_id']}")
             continue
         target.execute(
             """INSERT INTO live_events(event_id,session_id,provider,room_id,event_type,event_time,user_id,user_name,
@@ -195,12 +538,55 @@ def migrate_legacy_live(source: sqlite3.Connection, target: sqlite3.Connection, 
         """SELECT session_id,recorded_at,online,comment_rate,like_rate,gift_rate,active_users,
         heat_score,purchase_ratio,positive_ratio,negative_ratio FROM live_metric_snapshots ORDER BY id"""
     ):
+        existing = target.execute(
+            """SELECT online,comment_rate,like_rate,gift_rate,active_users,heat_score,
+            purchase_ratio,positive_ratio,negative_ratio FROM live_metric_snapshots
+            WHERE session_id=? AND recorded_at=?""",
+            (session_map[row["session_id"]], row["recorded_at"]),
+        ).fetchone()
+        expected_snapshot = (
+            row["online"], row["comment_rate"], row["like_rate"], row["gift_rate"], row["active_users"],
+            row["heat_score"], row["purchase_ratio"], row["positive_ratio"], row["negative_ratio"],
+        )
+        if existing:
+            if tuple(existing) != expected_snapshot:
+                raise MigrationConflict(
+                    f"conflicting live_metric_snapshots identity: {row['session_id']}:{row['recorded_at']}"
+                )
+            continue
         target.execute(
             """INSERT INTO live_metric_snapshots(session_id,recorded_at,online,comment_rate,like_rate,gift_rate,
             active_users,heat_score,purchase_ratio,positive_ratio,negative_ratio) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (session_map[row["session_id"]], row["recorded_at"], row["online"], row["comment_rate"], row["like_rate"], row["gift_rate"], row["active_users"], row["heat_score"], row["purchase_ratio"], row["positive_ratio"], row["negative_ratio"]),
         )
         snapshot_count += 1
+
+    if table_exists(source, "capture_gaps") and table_exists(target, "capture_gaps"):
+        for row in source.execute(
+            """SELECT provider,room_id,session_id,run_id,gap_start,gap_end,reason,source,status
+            FROM capture_gaps ORDER BY id"""
+        ):
+            mapped_session_id = session_map.get(row["session_id"]) if row["session_id"] is not None else None
+            existing = target.execute(
+                """SELECT 1 FROM capture_gaps
+                WHERE provider=? AND room_id=? AND session_id IS ? AND run_id IS ?
+                  AND gap_start=? AND gap_end IS ? AND reason=? AND source=? AND status=?""",
+                (
+                    row["provider"], row["room_id"], mapped_session_id, row["run_id"],
+                    row["gap_start"], row["gap_end"], row["reason"], row["source"], row["status"],
+                ),
+            ).fetchone()
+            if existing:
+                continue
+            target.execute(
+                """INSERT INTO capture_gaps(
+                  provider,room_id,session_id,run_id,gap_start,gap_end,reason,source,status
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    row["provider"], row["room_id"], mapped_session_id, row["run_id"],
+                    row["gap_start"], row["gap_end"], row["reason"], row["source"], row["status"],
+                ),
+            )
     target.commit()
     return len(session_map), event_count, snapshot_count
 
@@ -211,6 +597,194 @@ def drop_legacy_tables(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def _copy_bundle(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    for suffix in ("-wal", "-shm"):
+        source_sidecar = source.with_name(source.name + suffix)
+        destination_sidecar = destination.with_name(destination.name + suffix)
+        if source_sidecar.exists():
+            shutil.copy2(source_sidecar, destination_sidecar)
+
+
+def _remove_bundle(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+def _restore_bundle(original: Path, active: Path) -> None:
+    _remove_bundle(active)
+    shutil.copy2(original, active)
+    for suffix in ("-wal", "-shm"):
+        original_sidecar = original.with_name(original.name + suffix)
+        active_sidecar = active.with_name(active.name + suffix)
+        if original_sidecar.exists():
+            shutil.copy2(original_sidecar, active_sidecar)
+        elif active_sidecar.exists():
+            active_sidecar.unlink()
+
+
+def _write_state(path: Path, payload: Dict[str, object]) -> None:
+    _write_manifest(path, payload)
+    directory_fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def recover_migration(workspace: Path) -> bool:
+    """Roll back an interrupted switch using the durable switch state."""
+
+    state_path = Path(workspace) / "migration-state.json"
+    if not state_path.exists():
+        return False
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("status") not in {"switching", "rollback-needed"}:
+        return False
+    for item in state.get("databases", []):
+        active = Path(item["active"])
+        original = Path(item["original"])
+        if original.exists():
+            _restore_bundle(original, active)
+    state["status"] = "rolled-back"
+    _write_state(state_path, state)
+    return True
+
+
+def apply_migration(
+    bilibili_path: Path,
+    douyin_path: Path,
+    workspace: Path,
+    fail_stage: str | None = None,
+) -> Dict[str, object]:
+    """Migrate isolated candidates and atomically switch them with rollback state."""
+
+    bilibili_path = Path(bilibili_path)
+    douyin_path = Path(douyin_path)
+    workspace = Path(workspace)
+    if not bilibili_path.exists() or not douyin_path.exists():
+        missing = bilibili_path if not bilibili_path.exists() else douyin_path
+        raise FileNotFoundError(f"database does not exist: {missing}")
+    if workspace.exists() and any(workspace.iterdir()):
+        if (workspace / "migration-state.json").exists():
+            recovery_locks = []
+            try:
+                for path in (bilibili_path, douyin_path):
+                    recovery_locks.append(_acquire_database_lock(path))
+                if recover_migration(workspace):
+                    raise RehearsalFailure("recovered-interrupted-switch")
+            finally:
+                for lock in reversed(recovery_locks):
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    lock.close()
+        raise FileExistsError(f"migration workspace is not empty: {workspace}")
+    workspace.mkdir(parents=True, exist_ok=True)
+    source_dir = workspace / "source"
+    staging_dir = workspace / "staging"
+    original_dir = workspace / "original"
+    source_dir.mkdir()
+    staging_dir.mkdir()
+    original_dir.mkdir()
+    lock_handles = []
+    source_connections = []
+    staged_connections = []
+    try:
+        for path in (bilibili_path, douyin_path):
+            lock_handles.append(_acquire_database_lock(path))
+        source_paths = [source_dir / "bilibili.sqlite3", source_dir / "douyin.sqlite3"]
+        for source, destination in zip((bilibili_path, douyin_path), source_paths):
+            _copy_database_snapshot(source, destination)
+        _fail_if_requested(fail_stage, "copy")
+        for source_path in source_paths:
+            connection = connect(source_path)
+            source_connections.append(connection)
+            verify_database(connection)
+        _fail_if_requested(fail_stage, "verify-before")
+        staging_paths = [staging_dir / "bilibili.sqlite3", staging_dir / "douyin.sqlite3"]
+        for connection, destination in zip(source_connections, staging_paths):
+            backup(connection, destination)
+        for staging_path in staging_paths:
+            staged_connections.append(connect(staging_path))
+        staged_bilibili, staged_douyin = staged_connections
+        create_douyin_schema(staged_douyin)
+        create_capture_gap_schema(staged_bilibili, "sessions" if table_exists(staged_bilibili, "sessions") else "live_sessions")
+        rebuild_douyin_events(staged_douyin, True)
+        migrate_legacy_live(staged_bilibili, staged_douyin, True)
+        rebuild_bilibili_events(staged_bilibili, True)
+        staged_bilibili.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        staged_douyin.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        staged_bilibili.commit()
+        staged_douyin.commit()
+        _fail_if_requested(fail_stage, "migration")
+        for connection in staged_connections:
+            verify_database(connection)
+        _fail_if_requested(fail_stage, "verify-after")
+        original_paths = [original_dir / "bilibili.sqlite3", original_dir / "douyin.sqlite3"]
+        for source, original in zip((bilibili_path, douyin_path), original_paths):
+            _copy_bundle(source, original)
+        state_path = workspace / "migration-state.json"
+        state = {
+            "status": "prepared",
+            "schema_version": SCHEMA_VERSION,
+            "databases": [
+                {"name": "bilibili", "active": str(bilibili_path), "candidate": str(staging_paths[0]), "original": str(original_paths[0])},
+                {"name": "douyin", "active": str(douyin_path), "candidate": str(staging_paths[1]), "original": str(original_paths[1])},
+            ],
+        }
+        _write_state(state_path, state)
+        _fail_if_requested(fail_stage, "switch-before")
+        state["status"] = "switching"
+        state["switched"] = []
+        _write_state(state_path, state)
+        try:
+            for item in state["databases"]:
+                active = Path(item["active"])
+                candidate = Path(item["candidate"])
+                try:
+                    _remove_bundle(active)
+                    os.replace(candidate, active)
+                except Exception:
+                    _restore_bundle(Path(item["original"]), active)
+                    raise
+                state["switched"].append(item["name"])
+                _write_state(state_path, state)
+                if fail_stage == "switch":
+                    raise RehearsalFailure("switch")
+        except Exception:
+            for item in state["databases"]:
+                if item["name"] in state["switched"]:
+                    active = Path(item["active"])
+                    original = Path(item["original"])
+                    _restore_bundle(original, active)
+            state["status"] = "rolled-back"
+            _write_state(state_path, state)
+            raise
+        state["status"] = "applied"
+        _write_state(state_path, state)
+        for active in (bilibili_path, douyin_path):
+            check = connect(active)
+            try:
+                verify_database(check)
+            finally:
+                check.close()
+        return {
+            "status": "applied",
+            "backup": {"bilibili": str(original_paths[0]), "douyin": str(original_paths[1])},
+            "state": str(state_path),
+        }
+    finally:
+        for connection in reversed(staged_connections):
+            connection.close()
+        for connection in reversed(source_connections):
+            connection.close()
+        for lock in reversed(lock_handles):
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Govern Bullet-Screen SQLite databases")
     parser.add_argument("--bilibili", type=Path, default=DEFAULT_BILIBILI_DB)
@@ -219,32 +793,25 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true", help="apply the migration; without it only report changes")
     args = parser.parse_args()
 
+    if args.apply:
+        workspace = args.backup_dir or args.bilibili.parent / ".bullet-screen-db-migration"
+        result = apply_migration(args.bilibili, args.douyin, workspace)
+        print(f"migration state: {result['state']}")
+        print(f"backup: {result['backup']}")
+        print("database migration: APPLIED")
+        return
+
     bilibili = connect(args.bilibili)
     douyin = connect(args.douyin)
     try:
         backup_dir = None
-        if args.apply:
-            backup_dir = args.backup_dir or Path(tempfile.mkdtemp(prefix="Bullet-Screen-db-backup-"))
-            backup(bilibili, backup_dir / "bilibili.sqlite3")
-            backup(douyin, backup_dir / "douyin.sqlite3")
-            print(f"backup: {backup_dir}")
-            create_douyin_schema(douyin)
-            douyin_events = rebuild_douyin_events(douyin, True)
-        else:
-            douyin_events = rebuild_douyin_events(douyin, False)
-        legacy_counts = migrate_legacy_live(bilibili, douyin, args.apply)
-        bilibili_events = rebuild_bilibili_events(bilibili, args.apply)
-        if args.apply:
-            if all(table_exists(bilibili, table) for table in LEGACY_LIVE_TABLES):
-                drop_legacy_tables(bilibili)
-            bilibili.execute("PRAGMA user_version=2")
-            douyin.execute("PRAGMA user_version=2")
-            bilibili.commit()
-            douyin.commit()
+        douyin_events = rebuild_douyin_events(douyin, False)
+        legacy_counts = migrate_legacy_live(bilibili, douyin, False)
+        bilibili_events = rebuild_bilibili_events(bilibili, False)
         print(f"legacy live rows: sessions={legacy_counts[0]} events={legacy_counts[1]} snapshots={legacy_counts[2]}")
         print(f"bilibili events rebuild: {'yes' if bilibili_events else 'no'}")
         print(f"douyin events rebuild: {'yes' if douyin_events else 'no'}")
-        print("database migration: APPLIED" if args.apply else "database migration: DRY RUN (use --apply)")
+        print("database migration: DRY RUN (use --apply)")
     finally:
         bilibili.close()
         douyin.close()

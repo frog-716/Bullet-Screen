@@ -14,12 +14,14 @@ import re
 import threading
 import time
 import urllib.parse
+import uuid
 import zlib
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from live_intelligence import LiveEventStore, SignalEngine, china_timestamp, normalize_event, safe_int, utc_now
+from live_intelligence import EventConflictError, LiveEventStore, SignalEngine, china_timestamp, normalize_event, safe_int, utc_now
 
 try:
     import brotli  # type: ignore
@@ -29,10 +31,60 @@ except ImportError:  # pragma: no cover - optional runtime capability
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 DEFAULT_PROFILE_DIR = Path(__file__).resolve().parent / "data" / "browser-profile"
+FRESHNESS_TIMEOUT_SECONDS = 45.0
+MAX_RAW_PAYLOAD_BYTES = 2 * 1024 * 1024
+MAX_DECODED_PAYLOAD_BYTES = 4 * 1024 * 1024
+MAX_DECOMPRESSION_LAYERS = 4
+MAX_DECOMPRESSION_CANDIDATES = 16
+MAX_PROTO_NODES = 4096
+MAX_PROTOCOL_MESSAGES = 512
+MAX_JSON_DEPTH = 16
+MAX_JSON_NODES = 4096
+MAX_SEEN_CACHE = 4096
+SEEN_CACHE_TTL_SECONDS = 60 * 60
+
+
+def stale_gap_start(last_valid_at: str, freshness_seconds: float) -> str:
+    try:
+        parsed = datetime.fromisoformat(str(last_valid_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (parsed.astimezone(timezone.utc) + timedelta(seconds=freshness_seconds)).isoformat(timespec="milliseconds")
+    except (TypeError, ValueError, OverflowError):
+        return utc_now()
+
+
+def optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class AdapterError(RuntimeError):
     pass
+
+
+class BusyError(RuntimeError):
+    pass
+
+
+class ParseBudgetExceeded(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class RunContext:
+    generation: int
+    run_id: str
+    provider: str
+    room_id: str
+    room_url: str = field(repr=False)
+    cookie: str = field(repr=False)
+    mode: str
+    cancel: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
 
 
 def parse_room_input(value: str) -> Tuple[str, str]:
@@ -60,6 +112,19 @@ def parse_room_input(value: str) -> Tuple[str, str]:
     return room_id, "https://live.douyin.com/" + room_id + suffix
 
 
+def is_douyin_resource_url(value: str) -> bool:
+    parsed = urllib.parse.urlparse(str(value or ""))
+    if parsed.scheme not in ("https", "wss"):
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host == "douyin.com" or host.endswith(".douyin.com")
+
+
+def is_douyin_protocol_url(value: str) -> bool:
+    parsed = urllib.parse.urlparse(str(value or ""))
+    return is_douyin_resource_url(value) and parsed.path.startswith(("/webcast", "/aweme/"))
+
+
 def _cookie_pairs(cookie: str) -> List[Dict[str, str]]:
     cookies = []
     for item in str(cookie or "").split(";"):
@@ -82,15 +147,21 @@ def _decode_varint(data: bytes, offset: int) -> Tuple[int, int]:
     raise ValueError("invalid protobuf varint")
 
 
-def _protobuf_strings(data: bytes, depth: int = 0) -> List[str]:
+def _protobuf_strings(data: bytes, depth: int = 0, _budget: Optional[Dict[str, int]] = None) -> List[str]:
     """Extract printable strings from nested protobuf bytes without a schema."""
 
+    budget = _budget or {"nodes": 0}
     if depth > 3 or not data:
         return []
+    if len(data) > MAX_RAW_PAYLOAD_BYTES:
+        raise ParseBudgetExceeded("protobuf input exceeds size budget")
     strings: List[str] = []
     offset = 0
     try:
         while offset < len(data):
+            budget["nodes"] += 1
+            if budget["nodes"] > MAX_PROTO_NODES:
+                raise ParseBudgetExceeded("protobuf node budget exceeded")
             key, offset = _decode_varint(data, offset)
             wire_type = key & 7
             if wire_type == 0:
@@ -109,7 +180,7 @@ def _protobuf_strings(data: bytes, depth: int = 0) -> List[str]:
                         strings.append(decoded[:240])
                 except UnicodeDecodeError:
                     pass
-                strings.extend(_protobuf_strings(value, depth + 1))
+                strings.extend(_protobuf_strings(value, depth + 1, budget))
             elif wire_type == 5:
                 offset += 4
             else:
@@ -121,13 +192,19 @@ def _protobuf_strings(data: bytes, depth: int = 0) -> List[str]:
     return list(dict.fromkeys(strings))
 
 
-def _protobuf_fields(data: bytes) -> List[Tuple[int, int, Any]]:
+def _protobuf_fields(data: bytes, _budget: Optional[Dict[str, int]] = None) -> List[Tuple[int, int, Any]]:
     """Decode protobuf wire fields without importing generated schemas."""
 
+    if len(data) > MAX_RAW_PAYLOAD_BYTES:
+        raise ParseBudgetExceeded("protobuf input exceeds size budget")
+    budget = _budget or {"nodes": 0}
     fields: List[Tuple[int, int, Any]] = []
     offset = 0
     while offset < len(data):
         key, offset = _decode_varint(data, offset)
+        budget["nodes"] += 1
+        if budget["nodes"] > MAX_PROTO_NODES:
+            raise ParseBudgetExceeded("protobuf field budget exceeded")
         field_number, wire_type = key >> 3, key & 7
         if not field_number:
             raise ValueError("invalid protobuf field number")
@@ -190,12 +267,19 @@ def _nested_fields(fields: Sequence[Tuple[int, int, Any]], field_number: int) ->
 
 
 def _platform_timestamp(value: int) -> str:
-    number = int(value or 0)
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return ""
     if 1_000_000_000_000 <= number < 10_000_000_000_000:
         seconds = number / 1000.0
     elif 1_000_000_000 <= number < 10_000_000_000:
         seconds = float(number)
     else:
+        return ""
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds")
+    except (OverflowError, OSError, ValueError):
         return ""
 
 
@@ -204,10 +288,6 @@ def _timestamp_seconds(value: str) -> float:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError):
         return 0.0
-    try:
-        return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds")
-    except (OverflowError, OSError, ValueError):
-        return ""
 
 
 def _common_timestamp(fields: Sequence[Tuple[int, int, Any]], response_now: int = 0) -> Tuple[str, str]:
@@ -232,6 +312,8 @@ def _decode_im_response(payload: bytes) -> Dict[str, Any]:
     fields = _protobuf_fields(payload)
     messages = []
     for encoded in _field_values(fields, 1, 2):
+        if len(messages) >= MAX_PROTOCOL_MESSAGES:
+            raise ParseBudgetExceeded("protocol message budget exceeded")
         try:
             envelope = _protobuf_fields(bytes(encoded))
         except ValueError:
@@ -311,11 +393,10 @@ def _decode_im_event(message: Dict[str, Any], response_now: int = 0) -> Optional
         metadata["fansclub_action"] = _field_varint(fields, 2)
     elif method in ("WebcastRoomStatsMessage", "WebcastRoomUserSeqMessage"):
         event_type = "viewer_change"
-        online = _field_varint(fields, 5) if method == "WebcastRoomStatsMessage" else _field_varint(fields, 3)
+        online_values = _field_values(fields, 5 if method == "WebcastRoomStatsMessage" else 3, 0)
+        online = int(online_values[-1]) if online_values else None
         display_value = _field_text(fields, 2) if method == "WebcastRoomStatsMessage" else _field_text(fields, 4)
-        if not online:
-            return None
-        content = str(online)
+        content = str(online) if online is not None else "未知"
         metadata.update({"online": online, "display_value": display_value, "semantics": "protocol_online_count"})
     elif method == "WebcastControlMessage":
         status = _field_varint(fields, 2)
@@ -331,26 +412,57 @@ def _decode_im_event(message: Dict[str, Any], response_now: int = 0) -> Optional
     }
 
 
+def _bounded_zlib_decompress(payload: bytes, wbits: int) -> bytes:
+    decoder = zlib.decompressobj(wbits)
+    output = decoder.decompress(payload, MAX_DECODED_PAYLOAD_BYTES + 1)
+    if len(output) > MAX_DECODED_PAYLOAD_BYTES or decoder.unconsumed_tail:
+        raise ParseBudgetExceeded("decompressed payload exceeds size budget")
+    output += decoder.flush(MAX_DECODED_PAYLOAD_BYTES + 1 - len(output))
+    if len(output) > MAX_DECODED_PAYLOAD_BYTES:
+        raise ParseBudgetExceeded("decompressed payload exceeds size budget")
+    return output
+
+
+def _bounded_brotli_decompress(payload: bytes) -> bytes:
+    if brotli is None:
+        raise ParseBudgetExceeded("brotli decoder is unavailable")
+    decoder = brotli.Decompressor()
+    output = bytearray()
+    for offset in range(0, len(payload), 64 * 1024):
+        output.extend(decoder.process(payload[offset:offset + 64 * 1024]))
+        if len(output) > MAX_DECODED_PAYLOAD_BYTES:
+            raise ParseBudgetExceeded("decompressed payload exceeds size budget")
+    return bytes(output)
+
+
 def _decompress_candidates(payload: bytes) -> Iterable[bytes]:
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) > MAX_RAW_PAYLOAD_BYTES:
+        raise ParseBudgetExceeded("raw payload exceeds size budget")
     seen = set()
-    queue = [payload]
+    queue = [(bytes(payload), 0)]
     while queue:
-        value = queue.pop(0)
-        fingerprint = (len(value), value[:32])
+        value, depth = queue.pop(0)
+        fingerprint = (len(value), value[:32], value[-32:])
         if fingerprint in seen or not value:
             continue
         seen.add(fingerprint)
+        if len(seen) > MAX_DECOMPRESSION_CANDIDATES:
+            raise ParseBudgetExceeded("too many decompression candidates")
         yield value
-        decoders = [gzip.decompress, zlib.decompress]
+        if depth >= MAX_DECOMPRESSION_LAYERS:
+            continue
+        decoders = (lambda item: _bounded_zlib_decompress(item, 31), lambda item: _bounded_zlib_decompress(item, 15))
         if brotli is not None:
-            decoders.insert(0, brotli.decompress)
+            decoders = (_bounded_brotli_decompress,) + decoders
         for decoder in decoders:
             try:
                 decoded = decoder(value)
+            except ParseBudgetExceeded:
+                raise
             except Exception:
                 continue
             if decoded and decoded != value:
-                queue.append(decoded)
+                queue.append((decoded, depth + 1))
 
 
 def _method_type(method: str) -> str:
@@ -401,8 +513,9 @@ def _candidate_from_dict(payload: Dict[str, Any], method: str, source: str) -> O
         metadata["gift_name"] = str(gift_name)[:120]
         metadata["gift_count"] = gift_count
     if event_type == "viewer_change":
-        content = "在线人数 %s" % safe_int(_first_value(payload, ("online", "user_count", "total", "num", "count"), 0))
-        metadata["online"] = safe_int(_first_value(payload, ("online", "user_count", "total", "num", "count"), 0))
+        online = optional_int(_first_value(payload, ("online", "user_count", "total", "num", "count"), None))
+        content = "在线人数 %s" % (online if online is not None else "未知")
+        metadata["online"] = online
     if event_type == "live_status":
         content = str(content or _first_value(payload, ("status", "status_text"), "直播状态变化"))
     if not event_type:
@@ -410,18 +523,24 @@ def _candidate_from_dict(payload: Dict[str, Any], method: str, source: str) -> O
     return {"type": event_type, "user_id": user_id, "user_name": user_name, "content": content, "metadata": metadata}
 
 
-def _walk_json(payload: Any, source: str, method: str = "") -> Iterable[Dict[str, Any]]:
+def _walk_json(payload: Any, source: str, method: str = "", depth: int = 0, _budget: Optional[Dict[str, int]] = None) -> Iterable[Dict[str, Any]]:
+    budget = _budget or {"nodes": 0}
+    if depth > MAX_JSON_DEPTH:
+        raise ParseBudgetExceeded("JSON nesting exceeds size budget")
+    budget["nodes"] += 1
+    if budget["nodes"] > MAX_JSON_NODES:
+        raise ParseBudgetExceeded("JSON node budget exceeded")
     if isinstance(payload, dict):
-        local_method = str(_first_value(payload, ("method", "event", "cmd", "type"), method) or method)
-        candidate = _candidate_from_dict(payload, local_method, source)
+        local_method = str(_first_value(payload, ("method", "event", "cmd", "type"), "") or "")
+        candidate = _candidate_from_dict(payload, local_method, source) if local_method and _method_type(local_method) else None
         if candidate:
             yield candidate
         for key, value in payload.items():
-            if key not in ("metadata", "raw", "payload"):
-                yield from _walk_json(value, source, local_method)
+            if key in ("data", "messages", "events", "items", "body"):
+                yield from _walk_json(value, source, "", depth + 1, budget)
     elif isinstance(payload, list):
         for value in payload:
-            yield from _walk_json(value, source, method)
+            yield from _walk_json(value, source, "", depth + 1, budget)
 
 
 class DouyinPublicAdapter:
@@ -430,19 +549,35 @@ class DouyinPublicAdapter:
         self.room_id = parse_room_input(room_url)[0]
         self.cookie = cookie
         self.mode = mode if mode in ("auto", "playwright", "demo") else "auto"
-        self._seen_dom = set()
-        self._seen_protocol = set()
+        self._seen_dom: Dict[str, float] = {}
+        self._seen_protocol: Dict[str, float] = {}
         self._recent_protocol_comments: List[Tuple[str, str]] = []
         self._protocol_dom_validated = False
         self._last_dom_online: Optional[int] = None
+        self.parse_budget_drops = 0
+        self.unknown_protocol_frames = 0
 
-    def run(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None]) -> None:
+    @staticmethod
+    def _remember_seen(cache: Dict[str, float], value: str) -> bool:
+        now = time.monotonic()
+        previous = cache.get(value)
+        if previous is not None and now - previous <= SEEN_CACHE_TTL_SECONDS:
+            return False
+        cache[value] = now
+        expired = [key for key, stamp in cache.items() if now - stamp > SEEN_CACHE_TTL_SECONDS]
+        for key in expired:
+            cache.pop(key, None)
+        while len(cache) > MAX_SEEN_CACHE:
+            cache.pop(next(iter(cache)))
+        return True
+
+    def run(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None], on_activity: Optional[Callable[[], None]] = None, on_heartbeat: Optional[Callable[[], None]] = None) -> None:
         if self.mode == "demo":
-            self._run_demo(stop_event, emit, on_state)
+            self._run_demo(stop_event, emit, on_state, on_activity, on_heartbeat)
             return
-        self._run_playwright(stop_event, emit, on_state)
+        self._run_playwright(stop_event, emit, on_state, on_activity, on_heartbeat)
 
-    def _run_demo(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None]) -> None:
+    def _run_demo(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None], on_activity: Optional[Callable[[], None]] = None, on_heartbeat: Optional[Callable[[], None]] = None) -> None:
         on_state("connected", "MVP 演示直播间")
         emit({"type": "live_status", "content": "直播已开始", "metadata": {"source": "demo", "status": "online"}})
         samples = [
@@ -458,6 +593,10 @@ class DouyinPublicAdapter:
         ]
         index = 0
         while not stop_event.wait(1.1):
+            if on_heartbeat:
+                on_heartbeat()
+            if on_activity:
+                on_activity()
             item = samples[index % len(samples)]
             metadata = item[3] if len(item) > 3 else {"source": "demo"}
             emit({"type": item[0], "user_name": item[1], "content": item[2], "metadata": metadata})
@@ -466,7 +605,7 @@ class DouyinPublicAdapter:
             index += 1
         emit({"type": "live_status", "content": "采集已停止", "metadata": {"source": "demo", "status": "stopped"}})
 
-    def _run_playwright(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None]) -> None:
+    def _run_playwright(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None], on_activity: Optional[Callable[[], None]] = None, on_heartbeat: Optional[Callable[[], None]] = None) -> None:
         try:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
             from playwright.sync_api import sync_playwright  # type: ignore
@@ -503,13 +642,16 @@ class DouyinPublicAdapter:
                 protocol_state: Dict[str, Any] = {"active": False, "responses": 0, "messages": 0}
 
                 def handle_frame(payload: Any) -> None:
-                    if not capture_enabled:
+                    if not capture_enabled or not self._target_is_current(page):
                         return
-                    for candidate in self._parse_payload(payload, "websocket"):
+                    candidates = self._parse_payload(payload, "websocket")
+                    if candidates and on_activity:
+                        on_activity()
+                    for candidate in candidates:
                         emit(candidate)
 
                 def handle_websocket(websocket: Any) -> None:
-                    if "douyin" not in str(websocket.url).lower():
+                    if not is_douyin_protocol_url(str(websocket.url)):
                         return
                     websocket.on("framereceived", handle_frame)
 
@@ -519,19 +661,22 @@ class DouyinPublicAdapter:
                             return
                         content_type = str(response.headers.get("content-type", ""))
                         parsed_url = urllib.parse.urlparse(str(response.url))
+                        if not is_douyin_protocol_url(str(response.url)) or not self._target_is_current(page):
+                            return
                         if parsed_url.path == "/webcast/im/fetch/" and "protobuffer" in content_type:
                             decoded = _decode_im_response(response.body())
                             messages = list(decoded["messages"])
                             protocol_state["responses"] += 1
                             protocol_state["messages"] += len(messages)
+                            if on_activity:
+                                on_activity()
                             first_response = not protocol_state["active"]
                             protocol_state["active"] = True
                             emitted_current = 0
                             for message in messages:
                                 msg_id = safe_int(message.get("msg_id"))
-                                if not msg_id or msg_id in self._seen_protocol:
+                                if not msg_id or not self._remember_seen(self._seen_protocol, str(msg_id)):
                                     continue
-                                self._seen_protocol.add(msg_id)
                                 candidate = _decode_im_event(message, safe_int(decoded.get("now")))
                                 if not candidate:
                                     continue
@@ -545,7 +690,7 @@ class DouyinPublicAdapter:
                                 emitted_current += 1
                                 if candidate.get("type") == "comment":
                                     pair = (str(candidate.get("user_name") or ""), str(candidate.get("content") or ""))
-                                    self._recent_protocol_comments = (self._recent_protocol_comments + [pair])[-100:]
+                                    self._recent_protocol_comments = (self._recent_protocol_comments + [pair])[-20:]
                             if first_response:
                                 emit({
                                     "type": "live_status",
@@ -562,8 +707,17 @@ class DouyinPublicAdapter:
                             return
                         if "json" not in content_type:
                             return
+                        if safe_int(response.headers.get("content-length"), 0) > MAX_RAW_PAYLOAD_BYTES:
+                            self.parse_budget_drops += 1
+                            return
                         body = response.body()
-                        for candidate in self._parse_payload(body, "response"):
+                        if len(body) > MAX_RAW_PAYLOAD_BYTES:
+                            self.parse_budget_drops += 1
+                            return
+                        candidates = self._parse_payload(body, "response")
+                        if candidates and on_activity:
+                            on_activity()
+                        for candidate in candidates:
                             emit(candidate)
                     except Exception as error:
                         protocol_state["error"] = type(error).__name__
@@ -608,6 +762,8 @@ class DouyinPublicAdapter:
                     raise AdapterError("浏览器页面未加载直播内容；请使用 DOUYIN_HEADLESS=0 或配置 DOUYIN_PROFILE_DIR")
                 self._assert_target_room(page)
                 on_state("connected", title)
+                if on_activity:
+                    on_activity()
                 emit({
                     "type": "live_status",
                     "content": "目标页面已确认；等待 protobuf 实时事件流",
@@ -618,6 +774,8 @@ class DouyinPublicAdapter:
                 self._read_dom_fallback(page, emit, emit_existing=False)
                 started_polling = time.monotonic()
                 while not stop_event.wait(2.0):
+                    if on_heartbeat:
+                        on_heartbeat()
                     self._assert_target_room(page)
                     if protocol_state["active"]:
                         self._read_dom_fallback(page, lambda _candidate: None)
@@ -649,41 +807,46 @@ class DouyinPublicAdapter:
 
     def _parse_payload(self, payload: Any, source: str) -> Iterable[Dict[str, Any]]:
         if isinstance(payload, str):
+            if len(payload.encode("utf-8")) > MAX_RAW_PAYLOAD_BYTES:
+                self.parse_budget_drops += 1
+                return []
             try:
                 decoded = json.loads(payload)
-            except json.JSONDecodeError:
+                return list(_walk_json(decoded, source))
+            except (json.JSONDecodeError, ParseBudgetExceeded, RecursionError):
+                self.parse_budget_drops += 1
                 return []
-            return _walk_json(decoded, source)
+
         if not isinstance(payload, (bytes, bytearray)):
             return []
+        if len(payload) > MAX_RAW_PAYLOAD_BYTES:
+            self.parse_budget_drops += 1
+            return []
         candidates: List[Dict[str, Any]] = []
-        for data in _decompress_candidates(bytes(payload)):
-            try:
-                text = data.decode("utf-8")
-                decoded = json.loads(text)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                decoded = None
-            if decoded is not None:
-                candidates.extend(_walk_json(decoded, source))
-            strings = _protobuf_strings(data)
-            method = next((item for item in strings if _method_type(item)), "")
-            event_type = _method_type(method)
-            if event_type:
-                useful = [
-                    item for item in strings
-                    if item != method
-                    and len(item) <= 240
-                    and not any(token in item.lower() for token in ("http://", "https://", "wss://", "token", "signature", "sessionid", "cookie", "access_key"))
-                    and (any("\u4e00" <= char <= "\u9fff" for char in item) or "?" in item or "？" in item)
-                ]
-                content = max(useful, key=len, default="")
-                candidates.append({
-                    "type": event_type,
-                    "user_name": "匿名用户",
-                    "content": content or ("在线人数变化" if event_type == "viewer_change" else ""),
-                    "metadata": {"source": source, "method": method[:120], "frame_size": len(data)},
-                })
+        try:
+            for data in _decompress_candidates(bytes(payload)):
+                try:
+                    text = data.decode("utf-8")
+                    decoded = json.loads(text)
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                    self.unknown_protocol_frames += 1
+                    continue
+                try:
+                    candidates.extend(_walk_json(decoded, source))
+                except ParseBudgetExceeded:
+                    self.parse_budget_drops += 1
+                    return []
+        except ParseBudgetExceeded:
+            self.parse_budget_drops += 1
+            return []
         return candidates
+
+    def _target_is_current(self, page: Any) -> bool:
+        try:
+            self._assert_target_room(page)
+        except AdapterError:
+            return False
+        return True
 
     def _assert_target_room(self, page: Any) -> None:
         try:
@@ -742,9 +905,8 @@ class DouyinPublicAdapter:
             user_name = re.sub(r"\s+", " ", str(item.get("user_name") or "页面可见用户")).strip() or "页面可见用户"
             event_id = re.sub(r"[^0-9A-Za-z_\-]", "", str(item.get("event_id") or ""))[:120]
             identity = event_id or "%s|%s" % (user_name, text)
-            if not text or identity in self._seen_dom or len(text) > 240:
+            if not text or len(text) > 240 or not self._remember_seen(self._seen_dom, identity):
                 continue
-            self._seen_dom.add(identity)
             if not emit_existing:
                 continue
             event_type = self._dom_event_type(text)
@@ -839,9 +1001,12 @@ class DouyinCollector:
         self.store = LiveEventStore(db_path)
         self.signals = SignalEngine()
         self.mode = mode
+        self.command_lock = threading.RLock()
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
+        self._context: Optional[RunContext] = None
+        self.generation = 0
         self.session_id: Optional[int] = None
         self.last_session_id: Optional[int] = None
         self.room_id = ""
@@ -851,13 +1016,16 @@ class DouyinCollector:
         self.live_status = "unknown"
         self.last_error = ""
         self.last_event_at = ""
+        self.last_valid_at = ""
+        self._last_valid_monotonic = 0.0
+        self._connected_monotonic = 0.0
         self.online = 0
+        self.online_observed = False
         self.cookie = ""
         self.last_snapshot = 0.0
         self.diagnostics: Dict[str, Any] = {}
 
-    def start(self, room_input: str, cookie: str = "", mode: Optional[str] = None) -> None:
-        self.stop()
+    def start(self, room_input: str, cookie: str = "", mode: Optional[str] = None) -> RunContext:
         room_id, room_url = parse_room_input(room_input)
         requested_mode = mode or self.mode
         if self.mode == "demo":
@@ -866,48 +1034,97 @@ class DouyinCollector:
             raise AdapterError("真实服务禁止写入 demo 事件；请单独使用 server.py --mode demo")
         else:
             selected_mode = requested_mode
-        with self.lock:
-            self.room_id, self.room_url, self.cookie = room_id, room_url, str(cookie or "")
-            self.room_title = "抖音直播间 " + room_id
-            self.last_error = ""
-            self.last_event_at = ""
-            self.online = 0
-            self.live_status = "unknown"
-            self.diagnostics = {
-                "adapter": "DouyinPublicAdapter",
-                "mode": selected_mode,
-                "cookie_present": bool(self.cookie),
-                "persistent_profile": True,
-            }
-            self.status_name = "connecting"
-            self.last_session_id = None
-            self.session_id = self.store.start_session("douyin", room_id, self.room_title, room_url)
-            self.stop_event = threading.Event()
-            self.thread = threading.Thread(target=self._run, args=(selected_mode,), name="douyin-collector", daemon=True)
-            self.thread.start()
-
-    def stop(self) -> None:
-        with self.lock:
-            self.stop_event.set()
-            current_thread = self.thread
-            session_id = self.session_id
-        if current_thread and current_thread is not threading.current_thread():
-            current_thread.join(timeout=3)
-        if session_id:
-            self.store.end_session(session_id, "stopped")
-        with self.lock:
-            if session_id:
-                self.last_session_id = session_id
-            self.thread = None
-            self.session_id = None
-            if session_id or current_thread:
-                self.status_name = "idle"
-                self.live_status = "unknown"
-                self.online = 0
+        with self.command_lock:
+            with self.lock:
+                if self.thread and self.thread.is_alive():
+                    raise BusyError("previous collector run is still stopping")
+                self.thread = None
+                self.generation += 1
+                context = RunContext(self.generation, uuid.uuid4().hex, "douyin", room_id, room_url, str(cookie or ""), selected_mode)
+                self._context = context
+                self.room_id, self.room_url, self.cookie = context.room_id, context.room_url, context.cookie
+                self.room_title = "抖音直播间 " + room_id
+                self.last_error = ""
                 self.last_event_at = ""
-                self.diagnostics.pop("transport", None)
-                self.diagnostics.pop("protocol_verified", None)
-                self.diagnostics.pop("protocol_dom_exact_matches", None)
+                self.last_valid_at = ""
+                self._last_valid_monotonic = 0.0
+                self._connected_monotonic = 0.0
+                self.online = 0
+                self.online_observed = False
+                self.live_status = "unknown"
+                self.diagnostics = {
+                    "adapter": "DouyinPublicAdapter",
+                    "mode": selected_mode,
+                    "cookie_present": bool(self.cookie),
+                    "persistent_profile": True,
+                }
+                self.status_name = "connecting"
+                self.last_session_id = None
+                self.session_id = self.store.start_session("douyin", room_id, self.room_title, room_url)
+                self.store.open_gap("douyin", room_id, self.session_id, context.run_id, "connecting")
+                self.stop_event = context.cancel
+                self.thread = threading.Thread(target=self._run, args=(context,), name=f"douyin-collector-{context.generation}", daemon=True)
+                self.thread.start()
+                return context
+
+    def stop(self, timeout: float = 3.0) -> bool:
+        with self.command_lock:
+            with self.lock:
+                context, current_thread = self._context, self.thread
+                if context is None or current_thread is None:
+                    if context is not None:
+                        self.status_name = "stopped"
+                    return True
+                context.cancel.set()
+                self.stop_event = context.cancel
+                self.status_name = "stopping"
+            if current_thread is threading.current_thread():
+                return False
+            current_thread.join(max(0.0, timeout))
+            with self.lock:
+                if current_thread.is_alive():
+                    if self._context is context:
+                        self.status_name = "stopping"
+                    return False
+                if self._context is context:
+                    self.status_name = "stopped"
+                    self.thread = None
+                return True
+
+    def is_current_run(self, context: RunContext) -> bool:
+        with self.lock:
+            return self._context is context and not context.cancel.is_set()
+
+    def _owns_active_run(self, context: RunContext) -> bool:
+        with self.lock:
+            return self._context is context and not context.cancel.is_set() and self.status_name in {"connecting", "connected", "stale"}
+
+    def _mark_valid(self, context: RunContext) -> bool:
+        with self.lock:
+            if self._context is not context or context.cancel.is_set():
+                return False
+            self.last_valid_at = utc_now()
+            self._last_valid_monotonic = time.monotonic()
+            if self.status_name == "stale":
+                self.status_name = "connected"
+                self.live_status = "online"
+                self.last_error = ""
+            if self.session_id:
+                self.store.close_open_gaps(self.session_id, context.run_id)
+            return True
+
+    def _expire_stale_locked(self) -> None:
+        freshness_anchor = self._last_valid_monotonic or self._connected_monotonic
+        if self.status_name == "connected" and freshness_anchor and time.monotonic() - freshness_anchor > FRESHNESS_TIMEOUT_SECONDS:
+            self.status_name = "stale"
+            self.live_status = "stale"
+            self.last_error = "connection stale: no valid collected event"
+            context = self._context
+            if context and self.session_id:
+                self.store.open_gap(
+                    "douyin", self.room_id, self.session_id, context.run_id, "stale",
+                    started_at=stale_gap_start(self.last_valid_at, FRESHNESS_TIMEOUT_SECONDS),
+                )
 
     def data_session_id(self) -> Optional[int]:
         with self.lock:
@@ -919,22 +1136,30 @@ class DouyinCollector:
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
+            self._expire_stale_locked()
+            context = self._context
+            connected = self.status_name == "connected" and self.session_id is not None
             return {
-                "available": True, "provider": "douyin", "connected": self.status_name == "connected",
+                "available": True, "provider": "douyin", "connected": connected,
                 "status": self.status_name, "room_id": self.room_id, "room_url": self.room_url,
-                "room_title": self.room_title, "session_id": self.session_id, "live_status": self.live_status,
-                "online": self.online, "last_event_at": china_timestamp(self.last_event_at),
+                "room_title": self.room_title, "session_id": self.session_id if connected else None, "generation": context.generation if context else 0, "run_id": context.run_id if context else None, "worker_alive": bool(self.thread and self.thread.is_alive()), "live_status": self.live_status,
+                "online": self.online if connected and self.online_observed else None,
+                "online_known": bool(connected and self.online_observed),
+                "online_measure": {"kind": "online_people", "value": self.online, "unit": "people", "source": "douyin_adapter"} if connected and self.online_observed else None,
+                "last_event_at": china_timestamp(self.last_event_at),
                 "last_event_at_utc": self.last_event_at,
+                "last_valid_at": self.last_valid_at,
+                "freshness_timeout_seconds": FRESHNESS_TIMEOUT_SECONDS,
                 "adapter_mode": self.diagnostics.get("mode", self.mode),
                 "last_error": self.last_error, "diagnostics": {key: value for key, value in self.diagnostics.items() if key != "cookie"},
             }
 
     def metrics(self) -> Dict[str, Any]:
-        events = self.recent_events(1000)
-        session_id = self.data_session_id()
-        snapshots = self.store.recent_snapshots(session_id, 60) if session_id else []
-        analysis = self.signals.build(events, self.online, snapshots)
         current = self.status()
+        session_id = self.data_session_id() if current["connected"] else None
+        events = self.store.recent_events(session_id, limit=None, since=datetime.fromtimestamp(time.time() - 300, timezone.utc).isoformat()) if session_id else []
+        snapshots = self.store.recent_snapshots(session_id, 60) if session_id else []
+        analysis = self.signals.build(events, current["online"] if current["connected"] else None, snapshots)
         current_window = analysis["current"]
         return {
             **current, **analysis,
@@ -943,39 +1168,95 @@ class DouyinCollector:
             "heat_score": current_window["heat_score"], "purchase_ratio": current_window["purchase_ratio"],
         }
 
-    def _run(self, mode: str) -> None:
+    def _record_heartbeat_snapshot(self, context: RunContext) -> None:
+        with self.lock:
+            if not self._owns_active_run(context) or not self.session_id:
+                return
+            session_id = self.session_id
+            if time.time() - self.last_snapshot < 30:
+                return
+        snapshot = self.metrics().get("current")
+        if not snapshot:
+            return
+        with self.lock:
+            if self._context is not context or context.cancel.is_set() or self.session_id != session_id:
+                return
+            self.store.insert_snapshot(session_id, snapshot)
+            self.last_snapshot = time.time()
+
+    def _run(self, context: RunContext) -> None:
+        terminal_status = "stopped"
+        adapter: Optional[DouyinPublicAdapter] = None
         try:
-            adapter = DouyinPublicAdapter(self.room_url, self.cookie, mode)
-            adapter.run(self.stop_event, self._ingest, self._state)
+            adapter = DouyinPublicAdapter(context.room_url, context.cookie, context.mode)
+            def on_activity() -> None:
+                with self.lock:
+                    if self._context is context:
+                        self.diagnostics.update({
+                            "parse_budget_drops": adapter.parse_budget_drops,
+                            "unknown_protocol_frames": adapter.unknown_protocol_frames,
+                            "seen_protocol_cache_size": len(adapter._seen_protocol),
+                            "seen_dom_cache_size": len(adapter._seen_dom),
+                        })
+            adapter.run(
+                context.cancel,
+                lambda candidate: self._ingest(context, candidate),
+                lambda name, title: self._state(context, name, title),
+                on_activity,
+                lambda: self._record_heartbeat_snapshot(context),
+            )
         except Exception as error:
             with self.lock:
-                if not self.stop_event.is_set():
+                if self._context is context and not context.cancel.is_set():
+                    terminal_status = "error"
                     self.status_name = "error"
                     self.live_status = "error"
                     self.online = 0
                     self.last_error = str(error)
         finally:
-            with self.lock:
-                session_id = self.session_id
-                if self.status_name == "connected":
-                    self.status_name = "offline"
-                    self.live_status = "offline"
-                    self.online = 0
-                self.session_id = None
+            if adapter is not None:
+                with self.lock:
+                    if self._context is context:
+                        self.diagnostics.update({
+                            "parse_budget_drops": adapter.parse_budget_drops,
+                            "unknown_protocol_frames": adapter.unknown_protocol_frames,
+                            "seen_protocol_cache_size": len(adapter._seen_protocol),
+                            "seen_dom_cache_size": len(adapter._seen_dom),
+                        })
+            self._finish_run(context, terminal_status)
+
+    def _finish_run(self, context: RunContext, terminal_status: str) -> None:
+        with self.lock:
+            owner = self._context is context
+            session_id = self.session_id if owner else None
+            if owner:
                 if session_id:
                     self.last_session_id = session_id
-            if session_id:
-                self.store.end_session(session_id, "error" if self.last_error else "stopped")
+                self.session_id = None
+                if self.status_name in {"connecting", "connected", "stale", "stopping"}:
+                    self.status_name = "error" if terminal_status == "error" else "stopped"
+                    if terminal_status == "stopped":
+                        self.live_status = "unknown"
+                        self.online = 0
+        if session_id:
+            self.store.close_open_gaps(session_id, context.run_id)
+            self.store.end_session(session_id, terminal_status)
 
-    def _state(self, name: str, title: str) -> None:
+    def _state(self, context: RunContext, name: str, title: str) -> None:
         with self.lock:
+            if not self._owns_active_run(context):
+                return
             self.status_name = name
             if title:
                 self.room_title = title[:200]
             self.live_status = "online" if name == "connected" else name
+            if name == "connected":
+                self._connected_monotonic = time.monotonic()
 
-    def _ingest(self, candidate: Dict[str, Any]) -> None:
+    def _ingest(self, context: RunContext, candidate: Dict[str, Any]) -> None:
         with self.lock:
+            if not self._owns_active_run(context):
+                return
             session_id = self.session_id
             room_id = self.room_id
         if not session_id:
@@ -989,11 +1270,28 @@ class DouyinCollector:
             with self.lock:
                 self.diagnostics["protocol_dom_exact_matches"] = safe_int(metadata.get("protocol_dom_exact_matches"))
         if candidate.get("type") == "viewer_change":
-            self.online = safe_int(metadata.get("online") or candidate.get("content"), self.online)
+            with self.lock:
+                if "online" in metadata and metadata.get("online") is not None:
+                    self.online = optional_int(metadata.get("online")) or 0
+                    self.online_observed = True
+                elif candidate.get("content") not in (None, ""):
+                    self.online = safe_int(candidate.get("content"), self.online)
+                    self.online_observed = True
         event = normalize_event(room_id, candidate.get("type", "live_status"), candidate.get("user_id", ""), candidate.get("user_name", "匿名用户"), candidate.get("content", ""), metadata, candidate.get("timestamp"))
-        if not self.store.insert_event(session_id, event):
+        try:
+            inserted = self.store.insert_event(session_id, event)
+        except EventConflictError as error:
+            with self.lock:
+                self.diagnostics["event_conflicts"] = safe_int(self.diagnostics.get("event_conflicts")) + 1
+                self.last_error = str(error)
+            return
+        if not inserted:
             return
         with self.lock:
+            source = str(metadata.get("source") or "")
+            proves_collection = source in {"fetch_protobuf", "response", "websocket", "protocol_validation", "demo"}
+            if proves_collection and (event["type"] != "live_status" or source == "demo"):
+                self._mark_valid(context)
             self.last_event_at = event["timestamp"]
             if event["type"] == "live_status":
                 self.live_status = "offline" if "结束" in event["content"] or metadata.get("status") == "offline" else "online"
