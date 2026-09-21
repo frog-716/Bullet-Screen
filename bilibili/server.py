@@ -36,9 +36,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "data" / "danmaku.sqlite3"
-STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/styles.css": "styles.css"}
+STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/snapshot_client.js": "snapshot_client.js", "/styles.css": "styles.css"}
 PUBLIC_API_PATHS = {"/api/health", "/api/bootstrap"}
-PROTECTED_API_PATHS = {"/api/status", "/api/metrics", "/api/events", "/api/connect", "/api/disconnect"}
+PROTECTED_API_PATHS = {"/api/status", "/api/metrics", "/api/events", "/api/snapshot", "/api/connect", "/api/disconnect"}
 MAX_REQUEST_BYTES = 64 * 1024
 REQUEST_TIMEOUT_SECONDS = 10.0
 FRESHNESS_TIMEOUT_SECONDS = 45.0
@@ -148,6 +148,29 @@ class SchemaVersionError(RuntimeError):
 
 class BusyError(RuntimeError):
     pass
+
+
+class SnapshotUnstableError(RuntimeError):
+    pass
+
+
+def snapshot_window_seconds(value: Any) -> int:
+    text = str(value or "300s").strip().lower()
+    if text.endswith("m"):
+        seconds = safe_int(text[:-1], 5) * 60
+    elif text.endswith("s"):
+        seconds = safe_int(text[:-1], 300)
+    else:
+        seconds = safe_int(text, 300)
+    return min(max(seconds, 10), 24 * 60 * 60)
+
+
+def snapshot_window(as_of: str, seconds: int) -> Tuple[str, str]:
+    end = parse_utc_timestamp(as_of)
+    if end is None:
+        end = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=seconds)
+    return start.isoformat(timespec="milliseconds"), end.isoformat(timespec="milliseconds")
 
 
 def _schema_default(value: Any) -> Optional[str]:
@@ -1021,6 +1044,8 @@ def parse_business_event(body: bytes) -> Optional[Dict[str, Any]]:
 
 
 class Collector:
+    provider_name = "bilibili"
+
     def __init__(self, store: EventStore) -> None:
         self.store = store
         self.command_lock = threading.RLock()
@@ -1171,6 +1196,96 @@ class Collector:
             if current["connected"]:
                 trend.append({"recorded_at": utc_now(), "online": current["online"], "likes": current["likes"], "danmaku_rate": current["rate"], "total_danmaku": current["total"]})
             return {**current, "ranking": sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:10], "keywords": sorted(keywords.items(), key=lambda item: item[1], reverse=True)[:10], "gift_quantity": gift_quantity, "revenue": None, "revenue_currency": None, "revenue_semantics": "unknown_currency_not_estimated", "trend": trend}
+
+    def snapshot(self, window: Any = "300s", limit: int = 100) -> Dict[str, Any]:
+        seconds = snapshot_window_seconds(window)
+        for _attempt in range(3):
+            with self.lock:
+                self._expire_stale_locked()
+                context = self._context
+                status_name = self.status_name
+                session_id = self.session_id
+                room_id = self.room_id
+                room_title = self.room_title
+                worker_alive = bool(self.thread and self.thread.is_alive())
+                last_valid_at = self.last_valid_at or None
+                as_of = utc_now()
+                start, end = snapshot_window(as_of, seconds)
+                coverage_end = (parse_utc_timestamp(end) + timedelta(milliseconds=1)).isoformat(timespec="milliseconds") if parse_utc_timestamp(end) else end
+                identity = (
+                    context.generation if context else 0,
+                    context.run_id if context else None,
+                    session_id,
+                    room_id,
+                    status_name,
+                    worker_alive,
+                    last_valid_at,
+                )
+                metrics = self.metrics()
+                events = self.store.recent_events(session_id, limit, since=start) if session_id else []
+                coverage = self.store.coverage(session_id, start, coverage_end) if session_id else {
+                    "session_id": None, "start": start, "end": end,
+                    "coverage_state": "unknown", "complete": False,
+                    "has_open_gap": False, "event_count": 0, "snapshot_count": 0, "gaps": [],
+                }
+                coverage["end"] = end
+                coverage["as_of"] = as_of
+                after_context = self._context
+                after_identity = (
+                    after_context.generation if after_context else 0,
+                    after_context.run_id if after_context else None,
+                    self.session_id,
+                    self.room_id,
+                    self.status_name,
+                    bool(self.thread and self.thread.is_alive()),
+                    self.last_valid_at or None,
+                )
+                if identity != after_identity:
+                    continue
+                metrics = {
+                    **metrics,
+                    "provider": self.provider_name,
+                    "room_id": room_id,
+                    "session_id": session_id,
+                    "run_id": context.run_id if context else None,
+                    "generation": context.generation if context else 0,
+                    "status": status_name,
+                    "as_of": as_of,
+                    "last_valid_at": last_valid_at,
+                }
+                return {
+                    "provider": self.provider_name,
+                    "room_id": room_id,
+                    "room_title": room_title,
+                    "session_id": session_id,
+                    "run_id": context.run_id if context else None,
+                    "generation": context.generation if context else 0,
+                    "status": status_name,
+                    "worker_alive": worker_alive,
+                    "data_source": "bilibili_websocket" if session_id else "none",
+                    "as_of": as_of,
+                    "last_valid_at": last_valid_at,
+                    "freshness": {
+                        "state": "stale" if status_name == "stale" else status_name,
+                        "stale": status_name == "stale",
+                        "last_valid_at": last_valid_at,
+                        "timeout_seconds": FRESHNESS_TIMEOUT_SECONDS,
+                    },
+                    "coverage": coverage,
+                    "metrics": metrics,
+                    "events": {
+                        "items": events,
+                        "session_id": session_id,
+                        "run_id": context.run_id if context else None,
+                        "generation": context.generation if context else 0,
+                        "as_of": as_of,
+                        "data_source": "bilibili_websocket" if session_id else "none",
+                        "count": len(events),
+                    },
+                    "error": self.last_error or None,
+                    "diagnostics": dict(self.diagnostics),
+                }
+        raise SnapshotUnstableError("collector identity changed while creating snapshot")
 
     def _run(self, context: RunContext) -> None:
         client = HttpClient(sessdata=context.sessdata)
@@ -1540,6 +1655,15 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/metrics":
             self._send_json(self.collector.metrics())
+            return
+        if parsed.path == "/api/snapshot":
+            query = urllib.parse.parse_qs(parsed.query)
+            window = (query.get("window") or ["300s"])[0]
+            limit = min(max(safe_int((query.get("limit") or [100])[0], 100), 1), 500)
+            try:
+                self._send_json(self.collector.snapshot(window=window, limit=limit))
+            except SnapshotUnstableError as error:
+                self._send_json({"error": str(error), "status": "snapshot_unstable"}, 409)
             return
         if parsed.path == "/api/events":
             query = urllib.parse.parse_qs(parsed.query)

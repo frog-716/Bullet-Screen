@@ -34,7 +34,7 @@
         </aside>
 
         <main class="dashboard" aria-label="实时运营看板">
-          <div class="dashboard-head"><div><span class="eyebrow">OPERATIONS DASHBOARD</span><h2>直播现场，一眼盯住关键变化</h2></div><div class="dashboard-tools"><span class="snapshot-label" id="snapshotLabel">等待本地服务</span><select id="rangeSelect" aria-label="数据范围" disabled><option value="live">当前实时会话</option></select><button class="reset-button" id="resetButton" type="button" title="重新同步当前状态">↺</button></div></div>
+          <div class="dashboard-head"><div><span class="eyebrow">OPERATIONS DASHBOARD</span><h2>直播现场，一眼盯住关键变化</h2></div><div class="dashboard-tools"><span class="snapshot-label" id="snapshotLabel">等待本地服务</span><select id="rangeSelect" aria-label="数据范围" disabled><option value="60s">最近 60 秒</option></select><button class="reset-button" id="resetButton" type="button" title="重新同步当前状态">↺</button></div></div>
 
           <section class="metric-grid" aria-label="核心指标">
             <article class="metric-card"><span class="metric-label">总场观</span><strong id="metricViews">—</strong><span class="metric-foot neutral">当前接口未提供</span></article><article class="metric-card"><span class="metric-label">直播热度</span><strong id="metricPeak">—</strong><span class="metric-foot neutral">B站热度值，非在线人数</span></article><article class="metric-card"><span class="metric-label">点赞事件</span><strong id="metricLikes">—</strong><span class="metric-foot neutral">当前连接收到的事件</span></article><article class="metric-card"><span class="metric-label">弹幕 / 分</span><strong id="metricRate">—</strong><span class="metric-foot neutral">最近 60 秒</span></article><article class="metric-card"><span class="metric-label">累计弹幕</span><strong id="metricDanmaku">—</strong><span class="metric-foot neutral">当前实时会话</span></article><article class="metric-card revenue"><span class="metric-label">礼物价值</span><strong id="metricRevenue">—</strong><span class="metric-foot neutral">币种未知时不估算金额</span></article>
@@ -53,6 +53,7 @@
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <div class="modal-backdrop" id="settingsModal" aria-hidden="true"><section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle"><div class="modal-head"><div><span class="eyebrow">CONNECTION</span><h2 id="settingsTitle">连接设置</h2></div><button class="modal-close" id="closeSettings" type="button" aria-label="关闭">×</button></div><div class="modal-body"><label class="form-label" for="roomInput">B 站房间号</label><div class="input-with-action"><input id="roomInput" value="7734200" inputmode="numeric" /><span>ROOM ID</span></div><p class="form-help">短房间号会在本地服务连接时转换为真实房间号。</p><label class="form-label" for="cookieInput">B 站 Cookie <span>可选</span></label><div class="input-with-action"><input id="cookieInput" type="password" placeholder="可粘贴完整 Cookie，或仅填写 SESSDATA" autocomplete="off" /><button id="toggleCookie" type="button">显示</button></div><p class="form-help warning-help">支持完整浏览器 Cookie 或仅 SESSDATA；只发送到本机服务进程，不写入 SQLite、不进入日志。</p><div class="security-note"><span>✓</span><div><strong>凭证安全</strong><p>浏览器不直连 B 站；Cookie 只在本机服务内存中用于请求，不会提交到远端。</p></div></div></div><div class="modal-actions"><button class="secondary-button" id="cancelSettings" type="button">取消</button><button class="primary-button" id="saveSettings" type="button">保存设置</button></div></section></div>
-    <script src="./app.js?v=20260824-1"></script>
+    <script src="./snapshot_client.js?v=20260921-1"></script>
+    <script src="./app.js?v=20260921-1"></script>
   </body>
 </html>

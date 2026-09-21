@@ -71,6 +71,35 @@ class BusyError(RuntimeError):
     pass
 
 
+class SnapshotUnstableError(RuntimeError):
+    pass
+
+
+def snapshot_window_seconds(value: Any) -> int:
+    text = str(value or "300s").strip().lower()
+    if text.endswith("m"):
+        seconds = safe_int(text[:-1], 5) * 60
+    elif text.endswith("s"):
+        seconds = safe_int(text[:-1], 300)
+    else:
+        seconds = safe_int(text, 300)
+    return min(max(seconds, 10), 24 * 60 * 60)
+
+
+def snapshot_window(as_of: str, seconds: int) -> Tuple[str, str]:
+    try:
+        end = datetime.fromisoformat(str(as_of).replace("Z", "+00:00"))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        end = end.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        end = datetime.now(timezone.utc)
+    return (
+        (end - timedelta(seconds=seconds)).isoformat(timespec="milliseconds"),
+        end.isoformat(timespec="milliseconds"),
+    )
+
+
 class ParseBudgetExceeded(ValueError):
     pass
 
@@ -1167,6 +1196,97 @@ class DouyinCollector:
             "gift_rate": current_window["gift_rate"], "active_users": current_window["active_users"],
             "heat_score": current_window["heat_score"], "purchase_ratio": current_window["purchase_ratio"],
         }
+
+    def snapshot(self, window: Any = "300s", limit: int = 100) -> Dict[str, Any]:
+        seconds = snapshot_window_seconds(window)
+        for _attempt in range(3):
+            with self.lock:
+                self._expire_stale_locked()
+                context = self._context
+                status_name = self.status_name
+                session_id = self.session_id
+                room_id = self.room_id
+                room_title = self.room_title
+                worker_alive = bool(self.thread and self.thread.is_alive())
+                last_valid_at = self.last_valid_at or None
+                as_of = utc_now()
+                start, end = snapshot_window(as_of, seconds)
+                coverage_end_dt = datetime.fromisoformat(end)
+                coverage_end = (coverage_end_dt + timedelta(milliseconds=1)).isoformat(timespec="milliseconds")
+                identity = (
+                    context.generation if context else 0,
+                    context.run_id if context else None,
+                    session_id,
+                    room_id,
+                    status_name,
+                    worker_alive,
+                    last_valid_at,
+                )
+                metrics = self.metrics()
+                events = self.store.recent_events(session_id, limit, since=start) if session_id else []
+                coverage = self.store.coverage(session_id, start, coverage_end) if session_id else {
+                    "session_id": None, "start": start, "end": end,
+                    "coverage_state": "unknown", "complete": False,
+                    "has_open_gap": False, "event_count": 0, "snapshot_count": 0, "gaps": [],
+                }
+                coverage["end"] = end
+                coverage["as_of"] = as_of
+                after_context = self._context
+                after_identity = (
+                    after_context.generation if after_context else 0,
+                    after_context.run_id if after_context else None,
+                    self.session_id,
+                    self.room_id,
+                    self.status_name,
+                    bool(self.thread and self.thread.is_alive()),
+                    self.last_valid_at or None,
+                )
+                if identity != after_identity:
+                    continue
+                metrics = {
+                    **metrics,
+                    "provider": self._context.provider if self._context else "douyin",
+                    "room_id": room_id,
+                    "session_id": session_id,
+                    "run_id": context.run_id if context else None,
+                    "generation": context.generation if context else 0,
+                    "status": status_name,
+                    "as_of": as_of,
+                    "last_valid_at": last_valid_at,
+                }
+                return {
+                    "provider": "douyin",
+                    "room_id": room_id,
+                    "room_title": room_title,
+                    "session_id": session_id,
+                    "run_id": context.run_id if context else None,
+                    "generation": context.generation if context else 0,
+                    "status": status_name,
+                    "worker_alive": worker_alive,
+                    "data_source": "douyin_adapter" if session_id else "none",
+                    "as_of": as_of,
+                    "last_valid_at": last_valid_at,
+                    "freshness": {
+                        "state": "stale" if status_name == "stale" else status_name,
+                        "stale": status_name == "stale",
+                        "last_valid_at": last_valid_at,
+                        "timeout_seconds": FRESHNESS_TIMEOUT_SECONDS,
+                    },
+                    "coverage": coverage,
+                    "metrics": metrics,
+                    "events": {
+                        "items": events,
+                        "session_id": session_id,
+                        "run_id": context.run_id if context else None,
+                        "generation": context.generation if context else 0,
+                        "as_of": as_of,
+                        "data_source": "douyin_adapter" if session_id else "none",
+                        "count": len(events),
+                    },
+                    "error": self.last_error or None,
+                    "diagnostics": {key: value for key, value in self.diagnostics.items() if key != "cookie"},
+                }
+        raise SnapshotUnstableError("collector identity changed while creating snapshot")
 
     def _record_heartbeat_snapshot(self, context: RunContext) -> None:
         with self.lock:
