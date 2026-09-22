@@ -368,14 +368,19 @@ class DouyinFreshnessRepairTests(unittest.TestCase):
             self.assertGreater(collector._last_valid_monotonic, 0.0)
             collector.store.close()
 
-    def test_transport_without_valid_event_becomes_stale(self):
+    def test_event_quiet_does_not_become_stale_until_protocol_times_out(self):
         with tempfile.TemporaryDirectory() as directory:
             collector = ADAPTER.DouyinCollector(Path(directory) / "douyin.sqlite3", mode="auto")
             context = ADAPTER.RunContext(1, "run-1", "douyin", "123456", "https://live.douyin.com/123456", "", "auto")
             collector._context = context
             collector.session_id = collector.store.start_session("douyin", "room", "title", "url")
             collector.status_name = "connected"
-            collector._connected_monotonic = time.monotonic() - ADAPTER.FRESHNESS_TIMEOUT_SECONDS - 1
+            collector._connected_monotonic = time.monotonic()
+            self.assertTrue(collector._mark_protocol(context))
+            collector._last_valid_monotonic = time.monotonic() - ADAPTER.EVENT_QUIET_AFTER_SECONDS - 1
+            self.assertEqual(collector.status()["status"], "connected")
+            self.assertEqual(collector.status()["activity_state"], "quiet")
+            collector._last_protocol_monotonic = time.monotonic() - ADAPTER.PROTOCOL_STALE_AFTER_SECONDS - 1
             self.assertEqual(collector.status()["status"], "stale")
             collector.store.close()
 

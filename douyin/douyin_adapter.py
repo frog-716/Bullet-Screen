@@ -31,7 +31,13 @@ except ImportError:  # pragma: no cover - optional runtime capability
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 DEFAULT_PROFILE_DIR = Path(__file__).resolve().parent / "data" / "browser-profile"
-FRESHNESS_TIMEOUT_SECONDS = 45.0
+# Event quietness is intentionally separate from protocol health.  The former
+# is a user-facing activity hint; the latter decides whether a capture gap is
+# warranted.
+EVENT_QUIET_AFTER_SECONDS = 45.0
+PROTOCOL_STALE_AFTER_SECONDS = 120.0
+# Compatibility alias for callers that still display the old event timeout.
+FRESHNESS_TIMEOUT_SECONDS = EVENT_QUIET_AFTER_SECONDS
 MAX_RAW_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_DECODED_PAYLOAD_BYTES = 4 * 1024 * 1024
 MAX_DECOMPRESSION_LAYERS = 4
@@ -42,6 +48,55 @@ MAX_JSON_DEPTH = 16
 MAX_JSON_NODES = 4096
 MAX_SEEN_CACHE = 4096
 SEEN_CACHE_TTL_SECONDS = 60 * 60
+PROTOCOL_DIAGNOSTIC_COUNTERS = (
+    "protocol_responses_total",
+    "protocol_responses_valid",
+    "protocol_responses_empty",
+    "protocol_responses_unknown_only",
+    "protocol_responses_malformed",
+    "protocol_responses_source_rejected",
+    "protocol_responses_with_events",
+    "protocol_messages_total",
+    "protocol_events_emitted",
+)
+PROTOCOL_DIAGNOSTIC_TIMESTAMPS = (
+    "last_protocol_response_at",
+    "last_empty_envelope_at",
+    "last_event_response_at",
+)
+PROTOCOL_MALFORMED_STAGES = (
+    "http_status",
+    "content_type",
+    "body_empty",
+    "body_read",
+    "envelope_decode",
+    "envelope_structure",
+    "message_decode",
+    "other",
+)
+PROTOCOL_DIAGNOSTIC_FIELDS = (
+    *PROTOCOL_DIAGNOSTIC_COUNTERS,
+    *PROTOCOL_DIAGNOSTIC_TIMESTAMPS,
+    "protocol_http_status_counts",
+    "protocol_content_type_counts",
+    "protocol_content_encoding_counts",
+    "protocol_malformed_stages",
+    "protocol_decode_success",
+    "protocol_decode_failure",
+)
+
+
+def new_protocol_diagnostics() -> Dict[str, Any]:
+    return {
+        **{key: 0 for key in PROTOCOL_DIAGNOSTIC_COUNTERS},
+        **{key: "" for key in PROTOCOL_DIAGNOSTIC_TIMESTAMPS},
+        "protocol_http_status_counts": {},
+        "protocol_content_type_counts": {},
+        "protocol_content_encoding_counts": {},
+        "protocol_malformed_stages": {key: 0 for key in PROTOCOL_MALFORMED_STAGES},
+        "protocol_decode_success": 0,
+        "protocol_decode_failure": 0,
+    }
 
 
 def stale_gap_start(last_valid_at: str, freshness_seconds: float) -> str:
@@ -585,6 +640,28 @@ class DouyinPublicAdapter:
         self._last_dom_online: Optional[int] = None
         self.parse_budget_drops = 0
         self.unknown_protocol_frames = 0
+        self.protocol_diagnostics = new_protocol_diagnostics()
+
+    def _protocol_stage(self, stage: str) -> None:
+        stages = self.protocol_diagnostics["protocol_malformed_stages"]
+        if stage in stages:
+            stages[stage] += 1
+            self.protocol_diagnostics["protocol_responses_malformed"] += 1
+
+    def _protocol_header_count(self, field: str, value: Any, default: str) -> None:
+        text = str(value or "").split(";", 1)[0].strip().lower()[:120] or default
+        counts = self.protocol_diagnostics[field]
+        counts[text] = counts.get(text, 0) + 1
+
+    def _protocol_response_metadata(self, response: Any) -> None:
+        status = safe_int(getattr(response, "status", 0), 0)
+        status_key = str(status) if status else "unknown"
+        status_counts = self.protocol_diagnostics["protocol_http_status_counts"]
+        status_counts[status_key] = status_counts.get(status_key, 0) + 1
+        headers = getattr(response, "headers", {}) or {}
+        self._protocol_header_count("protocol_content_type_counts", headers.get("content-type"), "missing")
+        self._protocol_header_count("protocol_content_encoding_counts", headers.get("content-encoding"), "none")
+        self.protocol_diagnostics["protocol_responses_total"] += 1
 
     @staticmethod
     def _remember_seen(cache: Dict[str, float], value: str) -> bool:
@@ -600,13 +677,31 @@ class DouyinPublicAdapter:
             cache.pop(next(iter(cache)))
         return True
 
-    def run(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None], on_activity: Optional[Callable[[], None]] = None, on_heartbeat: Optional[Callable[[], None]] = None) -> None:
+    def run(
+        self,
+        stop_event: threading.Event,
+        emit: Callable[[Dict[str, Any]], None],
+        on_state: Callable[[str, str], None],
+        on_activity: Optional[Callable[[], None]] = None,
+        on_heartbeat: Optional[Callable[[], None]] = None,
+        on_protocol: Optional[Callable[[], None]] = None,
+        on_protocol_diagnostics: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         if self.mode == "demo":
-            self._run_demo(stop_event, emit, on_state, on_activity, on_heartbeat)
+            self._run_demo(stop_event, emit, on_state, on_activity, on_heartbeat, on_protocol, on_protocol_diagnostics)
             return
-        self._run_playwright(stop_event, emit, on_state, on_activity, on_heartbeat)
+        self._run_playwright(stop_event, emit, on_state, on_activity, on_heartbeat, on_protocol, on_protocol_diagnostics)
 
-    def _run_demo(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None], on_activity: Optional[Callable[[], None]] = None, on_heartbeat: Optional[Callable[[], None]] = None) -> None:
+    def _run_demo(
+        self,
+        stop_event: threading.Event,
+        emit: Callable[[Dict[str, Any]], None],
+        on_state: Callable[[str, str], None],
+        on_activity: Optional[Callable[[], None]] = None,
+        on_heartbeat: Optional[Callable[[], None]] = None,
+        on_protocol: Optional[Callable[[], None]] = None,
+        on_protocol_diagnostics: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         on_state("connected", "MVP 演示直播间")
         emit({"type": "live_status", "content": "直播已开始", "metadata": {"source": "demo", "status": "online"}})
         samples = [
@@ -624,6 +719,8 @@ class DouyinPublicAdapter:
         while not stop_event.wait(1.1):
             if on_heartbeat:
                 on_heartbeat()
+            if on_protocol:
+                on_protocol()
             if on_activity:
                 on_activity()
             item = samples[index % len(samples)]
@@ -634,7 +731,16 @@ class DouyinPublicAdapter:
             index += 1
         emit({"type": "live_status", "content": "采集已停止", "metadata": {"source": "demo", "status": "stopped"}})
 
-    def _run_playwright(self, stop_event: threading.Event, emit: Callable[[Dict[str, Any]], None], on_state: Callable[[str, str], None], on_activity: Optional[Callable[[], None]] = None, on_heartbeat: Optional[Callable[[], None]] = None) -> None:
+    def _run_playwright(
+        self,
+        stop_event: threading.Event,
+        emit: Callable[[Dict[str, Any]], None],
+        on_state: Callable[[str, str], None],
+        on_activity: Optional[Callable[[], None]] = None,
+        on_heartbeat: Optional[Callable[[], None]] = None,
+        on_protocol: Optional[Callable[[], None]] = None,
+        on_protocol_diagnostics: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         try:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
             from playwright.sync_api import sync_playwright  # type: ignore
@@ -670,6 +776,10 @@ class DouyinPublicAdapter:
                 capture_started_at = 0.0
                 protocol_state: Dict[str, Any] = {"active": False, "responses": 0, "messages": 0}
 
+                def publish_protocol_diagnostics() -> None:
+                    if on_protocol_diagnostics:
+                        on_protocol_diagnostics(dict(self.protocol_diagnostics))
+
                 def handle_frame(payload: Any) -> None:
                     if not capture_enabled or not self._target_is_current(page):
                         return
@@ -690,48 +800,98 @@ class DouyinPublicAdapter:
                             return
                         content_type = str(response.headers.get("content-type", ""))
                         parsed_url = urllib.parse.urlparse(str(response.url))
+                        is_fetch_response = parsed_url.path == "/webcast/im/fetch/"
+                        if not is_fetch_response:
+                            return
+                        self._protocol_response_metadata(response)
                         if not is_douyin_protocol_url(str(response.url)) or not self._target_is_current(page):
+                            self.protocol_diagnostics["protocol_responses_source_rejected"] += 1
+                            publish_protocol_diagnostics()
                             return
-                        if parsed_url.path == "/webcast/im/fetch/" and "protobuffer" in content_type:
-                            decoded = _decode_im_response(response.body())
-                            messages = list(decoded["messages"])
-                            protocol_state["responses"] += 1
-                            protocol_state["messages"] += len(messages)
-                            first_response = not protocol_state["active"]
-                            protocol_state["active"] = True
-                            emitted_current = 0
-                            for message in messages:
-                                msg_id = safe_int(message.get("msg_id"))
-                                if not msg_id or not self._remember_seen(self._seen_protocol, str(msg_id)):
-                                    continue
-                                candidate = _decode_im_event(message, safe_int(decoded.get("now")))
-                                if not candidate:
-                                    continue
-                                # A first fetch may mix history with newly
-                                # observed events. Only accept platform-dated
-                                # messages at/after navigation; older or
-                                # timestamp-less messages remain seeded only.
-                                if first_response and _timestamp_seconds(str(candidate.get("timestamp") or "")) < capture_started_at - 2.0:
-                                    continue
-                                emit(candidate)
-                                emitted_current += 1
-                                if candidate.get("type") == "comment":
-                                    pair = (str(candidate.get("user_name") or ""), str(candidate.get("content") or ""))
-                                    self._recent_protocol_comments = (self._recent_protocol_comments + [pair])[-20:]
-                            if emitted_current and on_activity:
-                                on_activity()
-                            if first_response:
-                                emit({
-                                    "type": "live_status",
-                                    "content": "protobuf 长轮询已接通；首包按平台时间过滤历史消息",
-                                    "timestamp": _platform_timestamp(safe_int(decoded.get("now"))) or None,
-                                    "metadata": {
-                                        "source": "fetch_protobuf", "transport": "http_long_poll",
-                                        "status": "online", "seeded_messages": len(messages),
-                                        "emitted_current_messages": emitted_current, "complete": False,
-                                    },
-                                })
+                        response_status = safe_int(getattr(response, "status", 0), 0)
+                        if response_status < 200 or response_status >= 300:
+                            self._protocol_stage("http_status")
+                            publish_protocol_diagnostics()
                             return
+                        try:
+                            body = response.body()
+                        except Exception:
+                            self._protocol_stage("body_read")
+                            publish_protocol_diagnostics()
+                            return
+                        if not body:
+                            self._protocol_stage("body_empty")
+                            publish_protocol_diagnostics()
+                            return
+                        if "protobuffer" not in content_type:
+                            self._protocol_stage("content_type")
+                            publish_protocol_diagnostics()
+                            return
+                        try:
+                            decoded = _decode_im_response(body)
+                        except Exception:
+                            self.protocol_diagnostics["protocol_decode_failure"] += 1
+                            self._protocol_stage("envelope_decode")
+                            publish_protocol_diagnostics()
+                            return
+                        self.protocol_diagnostics["protocol_decode_success"] += 1
+                        if not isinstance(decoded, dict) or not isinstance(decoded.get("messages"), list):
+                            self._protocol_stage("envelope_structure")
+                            publish_protocol_diagnostics()
+                            return
+                        messages = list(decoded["messages"])
+                        self.protocol_diagnostics["protocol_responses_valid"] += 1
+                        self.protocol_diagnostics["last_protocol_response_at"] = utc_now()
+                        self.protocol_diagnostics["protocol_messages_total"] += len(messages)
+                        if not messages:
+                            self.protocol_diagnostics["protocol_responses_empty"] += 1
+                            self.protocol_diagnostics["last_empty_envelope_at"] = self.protocol_diagnostics["last_protocol_response_at"]
+                        if on_protocol:
+                            on_protocol()
+                        protocol_state["responses"] += 1
+                        protocol_state["messages"] += len(messages)
+                        first_response = not protocol_state["active"]
+                        protocol_state["active"] = True
+                        emitted_current = 0
+                        for message in messages:
+                            msg_id = safe_int(message.get("msg_id"))
+                            if not msg_id or not self._remember_seen(self._seen_protocol, str(msg_id)):
+                                continue
+                            candidate = _decode_im_event(message, safe_int(decoded.get("now")))
+                            if not candidate:
+                                continue
+                            # A first fetch may mix history with newly
+                            # observed events. Only accept platform-dated
+                            # messages at/after navigation; older or
+                            # timestamp-less messages remain seeded only.
+                            if first_response and _timestamp_seconds(str(candidate.get("timestamp") or "")) < capture_started_at - 2.0:
+                                continue
+                            emit(candidate)
+                            emitted_current += 1
+                            if candidate.get("type") == "comment":
+                                pair = (str(candidate.get("user_name") or ""), str(candidate.get("content") or ""))
+                                self._recent_protocol_comments = (self._recent_protocol_comments + [pair])[-20:]
+                        if emitted_current:
+                            self.protocol_diagnostics["protocol_responses_with_events"] += 1
+                            self.protocol_diagnostics["protocol_events_emitted"] += emitted_current
+                            self.protocol_diagnostics["last_event_response_at"] = self.protocol_diagnostics["last_protocol_response_at"]
+                        elif messages:
+                            self.protocol_diagnostics["protocol_responses_unknown_only"] += 1
+                        if emitted_current and on_activity:
+                            on_activity()
+                        if first_response:
+                            emit({
+                                "type": "live_status",
+                                "content": "protobuf 长轮询已接通；首包按平台时间过滤历史消息",
+                                "timestamp": _platform_timestamp(safe_int(decoded.get("now"))) or None,
+                                "metadata": {
+                                    "source": "fetch_protobuf", "transport": "http_long_poll",
+                                    "status": "online", "seeded_messages": len(messages),
+                                    "emitted_current_messages": emitted_current, "complete": False,
+                                },
+                            })
+                        publish_protocol_diagnostics()
+                        return
                         if response.request.resource_type not in ("xhr", "fetch"):
                             return
                         if "json" not in content_type:
@@ -1044,7 +1204,9 @@ class DouyinCollector:
         self.last_error = ""
         self.last_event_at = ""
         self.last_valid_at = ""
+        self.last_protocol_at = ""
         self._last_valid_monotonic = 0.0
+        self._last_protocol_monotonic = 0.0
         self._connected_monotonic = 0.0
         self.online = 0
         self.online_observed = False
@@ -1074,7 +1236,9 @@ class DouyinCollector:
                 self.last_error = ""
                 self.last_event_at = ""
                 self.last_valid_at = ""
+                self.last_protocol_at = ""
                 self._last_valid_monotonic = 0.0
+                self._last_protocol_monotonic = 0.0
                 self._connected_monotonic = 0.0
                 self.online = 0
                 self.online_observed = False
@@ -1084,6 +1248,7 @@ class DouyinCollector:
                     "mode": selected_mode,
                     "cookie_present": bool(self.cookie),
                     "persistent_profile": True,
+                    **new_protocol_diagnostics(),
                 }
                 self.status_name = "connecting"
                 self.last_session_id = None
@@ -1126,12 +1291,14 @@ class DouyinCollector:
         with self.lock:
             return self._context is context and not context.cancel.is_set() and self.status_name in {"connecting", "connected", "stale"}
 
-    def _mark_valid(self, context: RunContext) -> bool:
+    def _mark_protocol(self, context: RunContext) -> bool:
         with self.lock:
             if self._context is not context or context.cancel.is_set():
                 return False
-            self.last_valid_at = utc_now()
-            self._last_valid_monotonic = time.monotonic()
+            now = utc_now()
+            monotonic_now = time.monotonic()
+            self.last_protocol_at = now
+            self._last_protocol_monotonic = monotonic_now
             if self.status_name == "stale":
                 self.status_name = "connected"
                 self.live_status = "online"
@@ -1140,18 +1307,72 @@ class DouyinCollector:
                 self.store.close_open_gaps(self.session_id, context.run_id)
             return True
 
+    def _mark_valid(self, context: RunContext) -> bool:
+        with self.lock:
+            if self._context is not context or context.cancel.is_set():
+                return False
+            now = utc_now()
+            monotonic_now = time.monotonic()
+            self.last_protocol_at = now
+            self._last_protocol_monotonic = monotonic_now
+            self.last_valid_at = now
+            self._last_valid_monotonic = monotonic_now
+            if self.status_name == "stale":
+                self.status_name = "connected"
+                self.live_status = "online"
+                self.last_error = ""
+            if self.session_id:
+                self.store.close_open_gaps(self.session_id, context.run_id)
+            return True
+
+    def _protocol_availability_locked(self) -> str:
+        total = safe_int(self.diagnostics.get("protocol_responses_total"), 0)
+        if self.last_protocol_at or safe_int(self.diagnostics.get("protocol_responses_valid"), 0) > 0:
+            return "true"
+        if total > 0:
+            return "false"
+        return "unknown"
+
     def _expire_stale_locked(self) -> None:
-        freshness_anchor = self._last_valid_monotonic or self._connected_monotonic
-        if self.status_name == "connected" and freshness_anchor and time.monotonic() - freshness_anchor > FRESHNESS_TIMEOUT_SECONDS:
+        protocol_anchor = self._last_protocol_monotonic or self._connected_monotonic
+        if self.status_name == "connected" and protocol_anchor and time.monotonic() - protocol_anchor > PROTOCOL_STALE_AFTER_SECONDS:
             self.status_name = "stale"
             self.live_status = "stale"
-            self.last_error = "connection stale: no valid collected event"
+            self.last_error = "connection stale: no valid protocol response"
             context = self._context
             if context and self.session_id:
                 self.store.open_gap(
                     "douyin", self.room_id, self.session_id, context.run_id, "stale",
-                    started_at=stale_gap_start(self.last_valid_at, FRESHNESS_TIMEOUT_SECONDS),
+                    started_at=stale_gap_start(self.last_protocol_at, PROTOCOL_STALE_AFTER_SECONDS),
                 )
+
+    def _activity_state_locked(self, now: Optional[float] = None) -> str:
+        if self.status_name == "stale":
+            return "stale"
+        if self.status_name != "connected":
+            return self.status_name
+        if self._protocol_availability_locked() != "true":
+            return "unknown"
+        if not self._last_valid_monotonic:
+            return "quiet"
+        current = time.monotonic() if now is None else now
+        return "quiet" if current - self._last_valid_monotonic > EVENT_QUIET_AFTER_SECONDS else "active"
+
+    def _protocol_health_locked(self, now: Optional[float] = None) -> str:
+        if self.status_name == "stale":
+            return "stale"
+        if self.status_name != "connected":
+            return self.status_name
+        availability = self._protocol_availability_locked()
+        if availability == "false":
+            return "unavailable"
+        if availability == "unknown":
+            return "unknown"
+        anchor = self._last_protocol_monotonic or self._connected_monotonic
+        if not anchor:
+            return "unknown"
+        current = time.monotonic() if now is None else now
+        return "healthy" if current - anchor <= PROTOCOL_STALE_AFTER_SECONDS else "stale"
 
     def data_session_id(self) -> Optional[int]:
         with self.lock:
@@ -1166,6 +1387,9 @@ class DouyinCollector:
             self._expire_stale_locked()
             context = self._context
             connected = self.status_name == "connected" and self.session_id is not None
+            activity_state = self._activity_state_locked()
+            protocol_health = self._protocol_health_locked()
+            protocol_available = self._protocol_availability_locked()
             return {
                 "available": True, "provider": "douyin", "connected": connected,
                 "status": self.status_name, "room_id": self.room_id, "room_url": self.room_url,
@@ -1176,7 +1400,13 @@ class DouyinCollector:
                 "last_event_at": china_timestamp(self.last_event_at),
                 "last_event_at_utc": self.last_event_at,
                 "last_valid_at": self.last_valid_at,
-                "freshness_timeout_seconds": FRESHNESS_TIMEOUT_SECONDS,
+                "last_protocol_at": self.last_protocol_at,
+                "protocol_available": protocol_available,
+                "activity_state": activity_state,
+                "protocol_health": protocol_health,
+                "event_quiet_after_seconds": EVENT_QUIET_AFTER_SECONDS,
+                "protocol_stale_after_seconds": PROTOCOL_STALE_AFTER_SECONDS,
+                "freshness_timeout_seconds": EVENT_QUIET_AFTER_SECONDS,
                 "adapter_mode": self.diagnostics.get("mode", self.mode),
                 "last_error": self.last_error, "diagnostics": {key: value for key, value in self.diagnostics.items() if key != "cookie"},
             }
@@ -1231,6 +1461,10 @@ class DouyinCollector:
                 room_title = self.room_title
                 worker_alive = bool(self.thread and self.thread.is_alive())
                 last_valid_at = self.last_valid_at or None
+                last_protocol_at = self.last_protocol_at or None
+                activity_state = self._activity_state_locked()
+                protocol_health = self._protocol_health_locked()
+                protocol_available = self._protocol_availability_locked()
                 as_of = utc_now()
                 start, end = snapshot_window(as_of, seconds)
                 coverage_end_dt = datetime.fromisoformat(end)
@@ -1242,7 +1476,11 @@ class DouyinCollector:
                     room_id,
                     status_name,
                     worker_alive,
+                    activity_state,
+                    protocol_health,
+                    last_protocol_at,
                     last_valid_at,
+                    protocol_available,
                 )
                 metrics = self.metrics()
                 events = self.store.recent_events(session_id, limit, since=start) if session_id else []
@@ -1261,7 +1499,11 @@ class DouyinCollector:
                     self.room_id,
                     self.status_name,
                     bool(self.thread and self.thread.is_alive()),
+                    self._activity_state_locked(),
+                    self._protocol_health_locked(),
+                    self.last_protocol_at or None,
                     self.last_valid_at or None,
+                    self._protocol_availability_locked(),
                 )
                 if identity != after_identity:
                     continue
@@ -1275,6 +1517,12 @@ class DouyinCollector:
                     "status": status_name,
                     "as_of": as_of,
                     "last_valid_at": last_valid_at,
+                    "last_protocol_at": last_protocol_at,
+                    "protocol_available": protocol_available,
+                    "activity_state": activity_state,
+                    "protocol_health": protocol_health,
+                    "event_quiet_after_seconds": EVENT_QUIET_AFTER_SECONDS,
+                    "protocol_stale_after_seconds": PROTOCOL_STALE_AFTER_SECONDS,
                 }
                 snapshot_signals = [{**signal, "generation": context.generation if context else 0} for signal in metrics.get("signals", [])]
                 metrics["signals"] = snapshot_signals
@@ -1290,11 +1538,20 @@ class DouyinCollector:
                     "data_source": "douyin_adapter" if session_id else "none",
                     "as_of": as_of,
                     "last_valid_at": last_valid_at,
+                    "last_protocol_at": last_protocol_at,
+                    "protocol_available": protocol_available,
+                    "activity_state": activity_state,
+                    "protocol_health": protocol_health,
                     "freshness": {
-                        "state": "stale" if status_name == "stale" else status_name,
+                        "state": "stale" if status_name == "stale" else activity_state,
                         "stale": status_name == "stale",
+                        "activity_state": activity_state,
+                        "protocol_health": protocol_health,
+                        "protocol_available": protocol_available,
+                        "last_protocol_at": last_protocol_at,
                         "last_valid_at": last_valid_at,
-                        "timeout_seconds": FRESHNESS_TIMEOUT_SECONDS,
+                        "event_quiet_after_seconds": EVENT_QUIET_AFTER_SECONDS,
+                        "protocol_stale_after_seconds": PROTOCOL_STALE_AFTER_SECONDS,
                     },
                     "coverage": coverage,
                     "metrics": metrics,
@@ -1343,12 +1600,24 @@ class DouyinCollector:
                             "seen_protocol_cache_size": len(adapter._seen_protocol),
                             "seen_dom_cache_size": len(adapter._seen_dom),
                         })
+            def on_protocol_diagnostics(stats: Dict[str, Any]) -> None:
+                with self.lock:
+                    if self._context is context:
+                        self.diagnostics.update({
+                            key: stats[key]
+                            for key in PROTOCOL_DIAGNOSTIC_FIELDS
+                            if key in stats
+                        })
+            def on_protocol() -> None:
+                self._mark_protocol(context)
             adapter.run(
                 context.cancel,
                 lambda candidate: self._ingest(context, candidate),
                 lambda name, title: self._state(context, name, title),
                 on_activity,
                 lambda: self._record_heartbeat_snapshot(context),
+                on_protocol,
+                on_protocol_diagnostics,
             )
         except Exception as error:
             with self.lock:
@@ -1368,6 +1637,7 @@ class DouyinCollector:
                             "seen_protocol_cache_size": len(adapter._seen_protocol),
                             "seen_dom_cache_size": len(adapter._seen_dom),
                         })
+                        self.diagnostics.update(adapter.protocol_diagnostics)
             self._finish_run(context, terminal_status)
 
     def _finish_run(self, context: RunContext, terminal_status: str) -> None:
@@ -1410,10 +1680,6 @@ class DouyinCollector:
         if metadata.get("source") == "fetch_protobuf":
             with self.lock:
                 self.diagnostics["transport"] = "http_long_poll_protobuf"
-                self.diagnostics["protocol_verified"] = True
-        if metadata.get("source") == "protocol_validation":
-            with self.lock:
-                self.diagnostics["protocol_dom_exact_matches"] = safe_int(metadata.get("protocol_dom_exact_matches"))
         if candidate.get("type") == "viewer_change":
             with self.lock:
                 if "online" in metadata and metadata.get("online") is not None:

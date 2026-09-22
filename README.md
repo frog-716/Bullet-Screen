@@ -45,6 +45,8 @@ python3 server.py --mode demo
 
 抖音真实浏览器采集需要额外安装 Playwright；详见 [`douyin/README.md`](douyin/README.md)。两套服务默认使用同一个端口，请勿同时启动，或为其中一个指定其他 `--port`。
 
+抖音的“页面已打开”不等于“协议采集可用”。`/api/status` 与 `/api/snapshot` 通过 `protocol_available=true/false/unknown` 区分：只有成功解码过正式 HTTP protobuf envelope 才能显示协议采集可用；部分 ready 直播页面可能只返回空 JSON 或短文本，原因目前 UNKNOWN，WebSocket binary transport 也尚未作为标准事件通道支持。因此当前不能保证所有 Douyin 房间都可靠采集。
+
 ## 数据边界
 
 本地 SQLite 位于各子项目自己的 `data/` 目录，并被 Git 忽略。Bilibili 页面输入的 Cookie 和 Douyin 页面手工输入的 Cookie 只在对应本地服务进程内存中使用，不写入数据库、日志或仓库。

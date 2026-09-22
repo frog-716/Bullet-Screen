@@ -36,8 +36,24 @@ function testStateHelpers(api) {
     status: "connected", events: { items: [] }, metrics: { online: 0 },
   });
   assert.strictEqual(zero.metrics.online, 0);
+  if (api === douyin) {
+    const quiet = api.applySnapshotState(snapshot, {
+      room_id: "room-b", session_id: "session-b", run_id: "run-b", generation: 2,
+      status: "connected", activity_state: "quiet", protocol_health: "healthy",
+      protocol_available: "true",
+      last_protocol_at: "2026-09-22T00:00:01Z", last_valid_at: null,
+      events: { items: [] }, metrics: { online: null },
+    });
+    assert.strictEqual(quiet.activityState, "quiet");
+    assert.strictEqual(quiet.protocolHealth, "healthy");
+    assert.strictEqual(quiet.protocolAvailable, "true");
+    assert.strictEqual(quiet.lastProtocolAt, "2026-09-22T00:00:01Z");
+    assert.strictEqual(api.statusText("connected", "unknown", "unknown"), "页面已打开 · 等待协议采集");
+    assert.strictEqual(api.statusText("connected", "unknown", "false"), "协议采集不可用");
+  }
   assert.strictEqual(api.statusText("stopping"), "正在停止，暂时不能重新启动");
-  assert.strictEqual(api.statusText("stale"), "服务还活着，但最近没有可靠数据");
+  assert.strictEqual(api.statusText("stale"), api === douyin ? "采集可能中断" : "服务还活着，但最近没有可靠数据");
+  if (api === douyin) assert.strictEqual(api.statusText("connected", "quiet", "true"), "采集正常 · 最近暂无新互动");
   assert.strictEqual(api.coverageText({ coverage_state: "unknown" }), "数据完整性未知");
   assert.strictEqual(api.coverageText({ coverage_state: "gap" }), "存在采集缺口");
   const cleared = api.clearSnapshotState(snapshot, "snapshot failed");

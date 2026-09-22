@@ -77,7 +77,7 @@ Playwright 运行时支持通过 `PLAYWRIGHT_EXECUTABLE_PATH` 指定完整浏览
 
 最终从空库连接房间 `174657918755` 做协议级对抗测试，得到以下可复核结果：
 
-- `/api/status`：`protocol_verified=true`，传输为 `http_long_poll_protobuf`，目标 URL 路径仍为 `/174657918755`；
+- `/api/status`：`protocol_available=true` 时，传输为 `http_long_poll_protobuf`，目标 URL 路径仍为 `/174657918755`；页面 ready 本身不会把协议标记为可用；
 - 32 条事件中有 28 条真实协议互动：`comment=3`、`entry=20`、`gift=2`、`like=1`、`viewer_change=2`，平台 `msg_id` 全部唯一；
 - 评论/礼物/进场/点赞没有任何 `source=dom` 混入；DOM 只保留首次在线点值和对照用途；
 - 两条协议评论的“用户名 + 正文”与同一页面可见行精确匹配；

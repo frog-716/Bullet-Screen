@@ -90,15 +90,24 @@ curl -X POST http://127.0.0.1:4173/api/disconnect \
 
 规则信号通过 `/api/snapshot` 的 `metrics.signals` 返回。当前最小门槛是最近 60 秒内至少 2 条命中消息、至少 2 个独立用户；同一用户刷屏不会满足独立用户门槛。`gap` 或 `unknown` coverage 不会产生强信号，重复计算同一窗口使用稳定 `signal_id` 幂等保存。用户可以调用 `POST /api/signals/feedback`，提交 `useful`、`false_positive` 或带非空 `note` 的备注；反馈不会自动改变规则。
 
+## 协议健康与事件静默
+
+`/api/status` 和 `/api/snapshot` 同时返回 `protocol_available`、`last_protocol_at` 与 `last_valid_at`。`protocol_available` 有三个值：`true` 表示本次会话至少成功解码过一个正式协议 envelope（即使没有消息），`false` 表示看到了协议响应但全部不是当前支持的合法 envelope，`unknown` 表示还没有足够协议证据。页面 ready 只说明浏览器页面加载完成，不会把 `protocol_available` 变成 `true`。
+
+`last_protocol_at` 表示最近一次通过来源校验并成功解码的正式协议响应，即使该响应没有消息也会更新；`last_valid_at` 只表示最近一次成功标准化并写入的有效事件。只有 `protocol_available=true` 且协议健康时，`EVENT_QUIET_AFTER_SECONDS=45` 才会把页面状态标成“采集正常 · 最近暂无新互动”；页面 ready 或非协议响应不会伪装成 quiet。`PROTOCOL_STALE_AFTER_SECONDS=120` 用于判断协议链是否失去可信响应，超过后才进入 `stale` 并记录缺口。这两个值是可解释的产品保护阈值，不是统计学结论。合法空 envelope 不等于采集失败，malformed/unknown 协议数据和未知 WebSocket frame 也不会刷新任一有效 freshness 时钟。
+
+同一个正式 Collector 的 `status` 和 `snapshot.diagnostics` 还提供只读协议计数：`protocol_responses_total/valid/empty/unknown_only/malformed/source_rejected/with_events`、`protocol_messages_total`、`protocol_events_emitted`，HTTP status/Content-Type/Content-Encoding 分布、malformed stage 分布、decode 成功/失败计数，以及三个最近响应时间字段。它们只用于说明正式 `/webcast/im/fetch/` handler 实际看到了什么，不参与 freshness、coverage 或状态机决策，也不返回 body、请求头、query、原始 payload 或凭证。
+
 ## 采集边界
 
 - 官方直播互动数据能力主要服务于已挂载直播玩法的房间，通常需要应用申请能力并启动推送任务，不能直接当作任意公开房间的通用观察 API。
-- 当前真实 Adapter 的主路径是 Playwright 监听页面 `/webcast/im/fetch/`，按页面实际传输 schema 解码 `application/protobuffer` 的 Response/Message 信封，再按 `WebcastChatMessage`、`MemberMessage`、`GiftMessage`、`LikeMessage`、`SocialMessage`、`RoomStatsMessage` 等稳定字段输出事件。平台 `msg_id` 直接作为幂等事件 ID，不再从二进制中猜字符串。
+- 当前真实 Adapter 的主路径是 Playwright 监听页面 `/webcast/im/fetch/`，在响应属于受支持的 `application/protobuffer` 形态时解码 Response/Message 信封，再按 `WebcastChatMessage`、`MemberMessage`、`GiftMessage`、`LikeMessage`、`SocialMessage`、`RoomStatsMessage` 等稳定字段输出事件。平台 `msg_id` 直接作为幂等事件 ID，不再从二进制中猜字符串。真实观察也发现，部分同样 ready 的公开页面只返回空 `application/json` 或短 `text/plain`，原因目前 UNKNOWN；这些页面不会被宣称为协议采集正常。
+- 已经真实验证过一条完整的临时 v4 链路：页面、HTTP protobuf、标准事件、EventStore、metrics、snapshot 和 Dashboard 可以连通；这不代表所有房间或所有匿名页面都具备同样的协议能力。
 - 首个协议响应可能混有历史消息：适配器用 Common/Response 的平台时间与连接开始时间比较，旧消息只播种去重；缺失平台时间时明确标记 `timestamp_source=collector_clock`，不伪装成平台事件时间。
 - 页面 DOM fallback 识别抖音当前的 `webcast-chatroom___item`，只提取连接后新增且当前可见的弹幕与系统提示；首屏已有消息只用于建立去重基线，不计入实时指标。
 - 协议可用时 DOM 只做对照验证，不会混入评论/礼物/点赞流；协议不可用超过 20 秒才降级为 DOM，并在 metadata 中标记 `source=dom`、`complete=false`。点赞按服务端批次统计，礼物连击数可能是累计值，Dashboard 不把它们冒充平台累计总量。
 - 采集期间持续校验目标房间 URL，自动跳转到其他房间会立即停止；断开后 API 不返回上一会话数据。
-- 这是对公开页面私有协议的观察实现，平台改版可能导致 schema 失效；后续可新增官方 Adapter 或 `DouyinSignedWebSocketAdapter`，只替换采集层，不改事件流水线、分析器和 Dashboard。
+- WebSocket binary transport 当前仍未作为标准事件通道支持；因此本项目不能保证所有 Douyin 房间都能可靠采集。上述能力边界属于当前真实验证结论，不应写成“Douyin 已完全支持”。这是对公开页面私有协议的观察实现，平台改版可能导致 schema 失效；后续可新增官方 Adapter 或 `DouyinSignedWebSocketAdapter`，只替换采集层，不改事件流水线、分析器和 Dashboard。
 
 ## 项目归类
 

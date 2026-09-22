@@ -182,11 +182,21 @@ class LifecycleTests(unittest.TestCase):
                     collector = case.collector
                     collector.start("1001")
                     self.assertTrue(case.started.wait(1))
+                    is_douyin = hasattr(collector, "_last_protocol_monotonic")
                     with collector.lock:
                         collector.status_name = "connected"
                         collector.session_id = 1
                         collector._last_valid_monotonic = time.monotonic() - 60
+                        if is_douyin:
+                            collector._last_protocol_monotonic = time.monotonic()
+                            collector.last_protocol_at = "fixture-protocol"
                     current = collector.status()
+                    if is_douyin:
+                        self.assertEqual(current["status"], "connected")
+                        self.assertEqual(current["activity_state"], "quiet")
+                        with collector.lock:
+                            collector._last_protocol_monotonic = time.monotonic() - DOUYIN_ADAPTER.PROTOCOL_STALE_AFTER_SECONDS - 1
+                        current = collector.status()
                     self.assertEqual(current["status"], "stale")
                     self.assertFalse(current["connected"])
 
