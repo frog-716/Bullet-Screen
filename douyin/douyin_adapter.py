@@ -697,8 +697,6 @@ class DouyinPublicAdapter:
                             messages = list(decoded["messages"])
                             protocol_state["responses"] += 1
                             protocol_state["messages"] += len(messages)
-                            if on_activity:
-                                on_activity()
                             first_response = not protocol_state["active"]
                             protocol_state["active"] = True
                             emitted_current = 0
@@ -720,6 +718,8 @@ class DouyinPublicAdapter:
                                 if candidate.get("type") == "comment":
                                     pair = (str(candidate.get("user_name") or ""), str(candidate.get("content") or ""))
                                     self._recent_protocol_comments = (self._recent_protocol_comments + [pair])[-20:]
+                            if emitted_current and on_activity:
+                                on_activity()
                             if first_response:
                                 emit({
                                     "type": "live_status",
@@ -791,8 +791,6 @@ class DouyinPublicAdapter:
                     raise AdapterError("浏览器页面未加载直播内容；请使用 DOUYIN_HEADLESS=0 或配置 DOUYIN_PROFILE_DIR")
                 self._assert_target_room(page)
                 on_state("connected", title)
-                if on_activity:
-                    on_activity()
                 emit({
                     "type": "live_status",
                     "content": "目标页面已确认；等待 protobuf 实时事件流",
