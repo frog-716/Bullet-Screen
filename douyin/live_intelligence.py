@@ -18,7 +18,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-from schema_v4 import SCHEMA_VERSION as V4_SCHEMA_VERSION, V4_TABLES, create_signal_schema, verify_signal_schema
+from schema_v4 import (
+    SCHEMA_VERSION as V4_SCHEMA_VERSION,
+    V4_TABLES,
+    create_signal_schema,
+    signal_id_for,
+    verify_signal_schema,
+)
 
 
 EVENT_TYPES = {
@@ -60,6 +66,13 @@ STOP_WORDS = {
 
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 SCHEMA_VERSION = V4_SCHEMA_VERSION
+RULE_VERSION = "rules-v2"
+SIGNAL_WINDOW_SECONDS = 60
+SIGNAL_TRIGGER_EVENT_COUNT = 2
+SIGNAL_TRIGGER_UNIQUE_USERS = 2
+SIGNAL_CLEAR_EVENT_COUNT = 1
+SIGNAL_CLEAR_UNIQUE_USERS = 1
+SIGNAL_COOLDOWN_SECONDS = 30
 CORE_SCHEMA_TABLES = {"live_sessions", "live_events", "live_metric_snapshots", "capture_gaps"}
 SCHEMA_COLUMNS = {
     "live_sessions": {
@@ -216,8 +229,13 @@ def _clean_text(value: Any, limit: int = 500) -> str:
     return text[:limit]
 
 
-def analyze_text(content: str) -> Dict[str, str]:
-    """Small, deterministic Chinese-first analyzer; replaceable by an LLM later."""
+def analyze_text(content: str) -> Dict[str, Any]:
+    """Conservative, deterministic Chinese-first analysis.
+
+    This is a candidate extractor, not a probability model.  Explicit
+    negation wins over a positive phrase.  Attribution/quotation is marked
+    uncertain and is never promoted to a strong signal by the rule engine.
+    """
 
     text = _clean_text(content)
     topic_rules = (
@@ -234,7 +252,17 @@ def analyze_text(content: str) -> Dict[str, str]:
             topic = candidate
             break
 
-    if any(word in text for word in ("怎么买", "怎么下单", "链接", "下单", "想买", "来一件", "拍一个")):
+    negative_purchase = any(word in text for word in ("不想买", "不买", "不考虑买", "不购买", "不打算买", "不会买"))
+    positive_purchase = any(word in text for word in ("怎么买", "怎么下单", "链接", "下单", "想买", "来一件", "拍一个", "马上买", "现在拍"))
+    negative_recommendation = any(word in text for word in ("不推荐", "不建议", "不太推荐"))
+    positive_recommendation = "推荐" in text and not negative_recommendation
+    attributed = bool(
+        re.search(r"(?:他说|她说|有人说|别人说|主播说|网友说|听说|据说)", text)
+        or re.search(r"[“”‘’\"']", text)
+    )
+    uncertain = attributed
+
+    if positive_purchase and not negative_purchase:
         intent = "purchase_consultation"
     elif any(word in text for word in ("多少钱", "价格", "几块", "几元", "多少米", "贵不贵")):
         intent = "price_consultation"
@@ -245,25 +273,34 @@ def analyze_text(content: str) -> Dict[str, str]:
     else:
         intent = "small_talk"
 
-    if any(word in text for word in ("骗人", "假的", "差评", "投诉", "失望", "垃圾", "没收到", "太慢", "不满意")):
+    if any(word in text for word in ("骗人", "假的", "差评", "投诉", "失望", "垃圾", "没收到", "太慢", "不满意", "不好用")) and not uncertain:
         sentiment = "negative"
-    elif any(word in text for word in ("喜欢", "不错", "好用", "满意", "推荐", "绝了", "支持")):
+    elif any(word in text for word in ("喜欢", "不错", "好用", "满意", "推荐", "绝了", "支持")) and not negative_recommendation and not uncertain:
         sentiment = "positive"
     else:
         sentiment = "neutral"
 
-    if intent == "purchase_consultation" or any(word in text for word in ("马上买", "现在拍", "要两件", "下单")):
+    if positive_purchase and not negative_purchase and not uncertain:
         purchase_intent = "high"
     elif intent in ("price_consultation", "product_question") or topic == "promotion":
         purchase_intent = "medium"
     else:
         purchase_intent = "low"
 
+    if negative_purchase:
+        purchase_intent = "low"
+        intent = "small_talk"
+    if uncertain and purchase_intent == "high":
+        purchase_intent = "low"
     return {
         "topic": topic,
         "intent": intent,
         "sentiment": sentiment,
         "purchase_intent": purchase_intent,
+        "recommendation": "negative" if negative_recommendation else "positive" if positive_recommendation and not uncertain else "unknown",
+        "uncertain": uncertain,
+        "quoted_or_attributed": attributed,
+        "rule_version": RULE_VERSION,
         "is_question": "true" if ("?" in text or "？" in text or intent not in ("small_talk", "complaint") and any(word in text for word in ("吗", "呢", "怎么", "多少", "能不能", "适合"))) else "false",
     }
 
@@ -458,8 +495,11 @@ class LiveEventStore:
         analysis = event.get("analysis") or {}
         metadata = dict(event.get("metadata") or {})
         metadata["_analysis"] = {
-            "version": "rules-v1",
+            "version": analysis.get("rule_version", RULE_VERSION),
             "is_question": analysis.get("is_question", "false"),
+            "recommendation": analysis.get("recommendation", "unknown"),
+            "uncertain": bool(analysis.get("uncertain", False)),
+            "quoted_or_attributed": bool(analysis.get("quoted_or_attributed", False)),
         }
         source_event_id = str(event.get("source_event_id") or "")
         if source_event_id:
@@ -538,6 +578,7 @@ class LiveEventStore:
             }
         return {
             "event_id": row["event_id"], "provider": row["provider"], "room_id": row["room_id"],
+            "_db_event_id": int(row["id"]),
             "source_event_id": metadata.get("_source_event_id", ""),
             "timestamp": timestamp, "event_time": timestamp, "timestamp_utc": timestamp_utc,
             "type": row["event_type"], "event_type": row["event_type"],
@@ -550,6 +591,10 @@ class LiveEventStore:
             "analysis": {
                 "topic": row["topic"] or "other", "intent": row["intent"] or "small_talk",
                 "sentiment": row["sentiment"] or "neutral", "purchase_intent": row["purchase_intent"] or "low", "is_question": is_question,
+                "recommendation": stored_analysis.get("recommendation", "unknown"),
+                "uncertain": bool(stored_analysis.get("uncertain", False)),
+                "quoted_or_attributed": bool(stored_analysis.get("quoted_or_attributed", False)),
+                "rule_version": stored_analysis.get("version", RULE_VERSION),
             },
             "value_contract": value_contract,
         }
@@ -695,14 +740,322 @@ class LiveEventStore:
             self.connection.close()
 
 
+class SignalPersistenceError(RuntimeError):
+    """A signal cannot be safely bound to the supplied session/evidence."""
+
+
+class SignalFeedbackError(ValueError):
+    """Feedback is invalid or points at a signal that does not exist."""
+
+
+def _event_timestamp(event: Dict[str, Any]) -> Any:
+    return event.get("timestamp_utc") or event.get("event_time") or event.get("timestamp")
+
+
+def _as_utc_text(value: Any) -> str:
+    parsed = parse_utc_timestamp(value)
+    if parsed is None:
+        raise ValueError(f"invalid UTC timestamp: {value}")
+    return parsed.isoformat(timespec="milliseconds")
+
+
+def _window_bounds(as_of: Any, seconds: int = SIGNAL_WINDOW_SECONDS) -> Tuple[str, str]:
+    parsed = parse_utc_timestamp(as_of)
+    if parsed is None:
+        raise ValueError("as_of must be a valid timestamp")
+    # Align windows so repeated evaluations during one bucket share one ID.
+    end_epoch = int(parsed.timestamp() // seconds) * seconds
+    end = datetime.fromtimestamp(end_epoch, timezone.utc)
+    if parsed == end:
+        window_end = end
+    else:
+        window_end = end + timedelta(seconds=seconds)
+    window_start = window_end - timedelta(seconds=seconds)
+    return window_start.isoformat(timespec="milliseconds"), window_end.isoformat(timespec="milliseconds")
+
+
+def _previous_signal(previous: Optional[Sequence[Dict[str, Any]]], signal_type: str = "purchase_intent") -> Optional[Dict[str, Any]]:
+    if not previous:
+        return None
+    if isinstance(previous, dict):
+        return previous
+    return next((item for item in reversed(list(previous)) if item.get("signal_type") == signal_type), None)
+
+
+def _candidate_events(events: Sequence[Dict[str, Any]], signal_type: str, start: str, end: str) -> List[Dict[str, Any]]:
+    start_dt = parse_utc_timestamp(start)
+    end_dt = parse_utc_timestamp(end)
+    if start_dt is None or end_dt is None:
+        return []
+    candidates: List[Dict[str, Any]] = []
+    for event in events:
+        event_dt = parse_utc_timestamp(_event_timestamp(event))
+        if event_dt is None or not start_dt <= event_dt < end_dt or event.get("type", event.get("event_type")) != "comment":
+            continue
+        analysis = event.get("analysis") or {}
+        if analysis.get("uncertain") or analysis.get("quoted_or_attributed"):
+            continue
+        if signal_type == "purchase_intent" and analysis.get("purchase_intent") == "high":
+            candidates.append(event)
+        elif signal_type == "recommendation" and analysis.get("recommendation") == "positive":
+            candidates.append(event)
+    return candidates
+
+
+def _user_key(event: Dict[str, Any]) -> str:
+    return str(event.get("user_id") or event.get("user", {}).get("id") or event.get("user_name") or event.get("user", {}).get("name") or "anonymous")
+
+
+def _signal_reason(signal_type: str, event_count: int, unique_user_count: int, coverage: str, status: str) -> str:
+    label = "购买意图" if signal_type == "purchase_intent" else "正向推荐"
+    base = f"最近 {SIGNAL_WINDOW_SECONDS} 秒内 {unique_user_count} 个独立用户的 {event_count} 条消息命中{label}规则。"
+    if coverage != "reliable_with_data":
+        return f"coverage={coverage}；{base}采集证据不足，不升级为强信号。"
+    if status == "cleared":
+        return f"{base}低于触发门槛，当前信号已清除。"
+    return base
+
+
+def evaluate_signal_window(
+    events: Sequence[Dict[str, Any]],
+    *,
+    provider: str = "fixture",
+    room_id: str = "fixture",
+    session_id: int = 1,
+    run_id: str = "replay",
+    as_of: str,
+    rule_version: str = RULE_VERSION,
+    coverage: str = "reliable_with_data",
+    previous: Optional[Sequence[Dict[str, Any]]] = None,
+    window_seconds: int = SIGNAL_WINDOW_SECONDS,
+) -> List[Dict[str, Any]]:
+    """Evaluate one deterministic window without I/O or wall-clock access."""
+
+    if not str(rule_version or "").strip():
+        raise ValueError("rule_version is required")
+    if coverage not in {"reliable_with_data", "reliable_no_events", "gap", "unknown"}:
+        raise ValueError(f"unsupported coverage: {coverage}")
+    as_of_text = _as_utc_text(as_of)
+    window_start, window_end = _window_bounds(as_of_text, window_seconds)
+    records: List[Dict[str, Any]] = []
+    for signal_type in ("purchase_intent", "recommendation"):
+        previous_signal = _previous_signal(previous, signal_type)
+        candidates = _candidate_events(events, signal_type, window_start, window_end)
+        event_count = len(candidates)
+        unique_user_count = len({_user_key(event) for event in candidates})
+        qualifies = event_count >= SIGNAL_TRIGGER_EVENT_COUNT and unique_user_count >= SIGNAL_TRIGGER_UNIQUE_USERS
+        holdable = event_count >= SIGNAL_CLEAR_EVENT_COUNT and unique_user_count >= SIGNAL_CLEAR_UNIQUE_USERS
+        prior_matches = previous_signal and previous_signal.get("signal_type") == signal_type
+        prior_active = bool(prior_matches and previous_signal.get("status") == "active")
+        prior_time = parse_utc_timestamp(previous_signal.get("as_of")) if previous_signal else None
+        current_time = parse_utc_timestamp(as_of_text)
+        in_cooldown = bool(prior_active and prior_time and current_time and 0 <= (current_time - prior_time).total_seconds() < SIGNAL_COOLDOWN_SECONDS)
+        if not candidates and not prior_active:
+            continue
+        if candidates and not qualifies and not prior_active:
+            # A sample below the trigger threshold is not itself a signal.
+            continue
+        if qualifies:
+            status = "active"
+            same_window = bool(previous_signal and previous_signal.get("window_end") == window_end)
+            strength = "strong" if coverage == "reliable_with_data" and (not in_cooldown or same_window) else "moderate" if coverage == "reliable_with_data" else "weak"
+        elif prior_active and (in_cooldown or holdable):
+            status = "active"
+            strength = "moderate" if coverage == "reliable_with_data" else "weak"
+        else:
+            status = "cleared"
+            strength = "weak"
+        evidence_ids = [str(event.get("event_id") or "") for event in candidates if event.get("event_id")]
+        row_ids = [int(event["_db_event_id"]) for event in candidates if event.get("_db_event_id") is not None]
+        signal = {
+            "signal_id": signal_id_for(provider, room_id, session_id, run_id, signal_type, rule_version, window_start, window_end),
+            "provider": provider,
+            "room_id": room_id,
+            "session_id": session_id,
+            "run_id": run_id,
+            "signal_type": signal_type,
+            "rule_version": rule_version,
+            "created_at": as_of_text,
+            "as_of": as_of_text,
+            "window_start": window_start,
+            "window_end": window_end,
+            "coverage": coverage,
+            "event_count": event_count,
+            "unique_user_count": unique_user_count,
+            "status": status,
+            "strength": strength,
+            "reason": _signal_reason(signal_type, event_count, unique_user_count, coverage, status),
+            "evidence_event_ids": evidence_ids,
+            "evidence_row_ids": row_ids,
+            "cooldown": in_cooldown,
+        }
+        records.append(signal)
+    return records
+
+
+def replay_signals(
+    events: Sequence[Dict[str, Any]],
+    *,
+    rule_version: str = RULE_VERSION,
+    as_of: str,
+    coverage: str = "reliable_with_data",
+    provider: str = "fixture",
+    room_id: str = "fixture",
+    session_id: int = 1,
+    run_id: str = "replay",
+    previous: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    return evaluate_signal_window(
+        events, provider=provider, room_id=room_id, session_id=session_id,
+        run_id=run_id, as_of=as_of, rule_version=rule_version,
+        coverage=coverage, previous=previous,
+    )
+
+
+def _event_table_name(event_table: str) -> str:
+    if event_table not in {"events", "live_events"}:
+        raise ValueError(f"unsupported event table: {event_table}")
+    return event_table
+
+
+def persist_signal(connection: sqlite3.Connection, signal: Dict[str, Any], event_table: str) -> None:
+    """Persist one signal and its FK-backed evidence idempotently."""
+
+    event_table = _event_table_name(event_table)
+    row_ids = [int(value) for value in signal.get("evidence_row_ids", [])]
+    if row_ids:
+        placeholders = ",".join("?" for _ in row_ids)
+        rows = connection.execute(
+            f"SELECT id,session_id FROM {event_table} WHERE id IN ({placeholders})",
+            row_ids,
+        ).fetchall()
+        valid = {int(row[0]) for row in rows if int(row[1]) == int(signal["session_id"])}
+        if valid != set(row_ids):
+            raise SignalPersistenceError("signal evidence is not contained in its session")
+    try:
+        connection.execute(
+            """INSERT INTO signals(
+              signal_id,provider,room_id,session_id,run_id,signal_type,rule_version,
+              created_at,as_of,window_start,window_end,coverage,event_count,
+              unique_user_count,status,strength,reason)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+              created_at=excluded.created_at, as_of=excluded.as_of,
+              coverage=excluded.coverage, event_count=excluded.event_count,
+              unique_user_count=excluded.unique_user_count, status=excluded.status,
+              strength=excluded.strength, reason=excluded.reason""",
+            (
+                signal["signal_id"], signal["provider"], signal["room_id"], signal["session_id"], signal["run_id"],
+                signal["signal_type"], signal["rule_version"], signal["created_at"], signal["as_of"],
+                signal["window_start"], signal["window_end"], signal["coverage"], signal["event_count"],
+                signal["unique_user_count"], signal["status"], signal["strength"], signal["reason"],
+            ),
+        )
+        for row_id in row_ids:
+            connection.execute("INSERT OR IGNORE INTO signal_evidence(signal_id,event_id) VALUES(?,?)", (signal["signal_id"], row_id))
+        connection.commit()
+    except sqlite3.IntegrityError as error:
+        connection.rollback()
+        raise SignalPersistenceError(str(error)) from error
+
+
+def _public_evidence_row(row: sqlite3.Row, event_table: str, provider: str) -> Dict[str, Any]:
+    if event_table == "live_events":
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        stable_id = str(metadata.get("_source_event_id") or row["stable_event_id"] or "")
+        event_type = row["event_type"]
+        event_time = row["event_time"]
+        user = row["user_name"] or "匿名用户"
+        summary = row["content"] or event_type
+    else:
+        stable_id = f"{provider}:event:{row['id']}"
+        event_type = row["event_type"]
+        event_time = row["event_time"]
+        user = row["uname"] or "匿名用户"
+        summary = row["text"] or row["gift_name"] or event_type
+    return {"event_id": stable_id, "event_type": event_type, "event_time": event_time, "user": user, "summary": str(summary)[:240]}
+
+
+def load_signals(
+    connection: sqlite3.Connection,
+    session_id: int,
+    provider: str,
+    room_id: str,
+    run_id: str,
+    event_table: str,
+    window_start: Optional[str] = None,
+    window_end: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    event_table = _event_table_name(event_table)
+    window_filter = ""
+    params: List[Any] = [session_id, provider, room_id, run_id]
+    if window_start is not None and window_end is not None:
+        window_filter = " AND window_start=? AND window_end=?"
+        params.extend((window_start, window_end))
+    rows = connection.execute(
+        f"SELECT * FROM signals WHERE session_id=? AND provider=? AND room_id=? AND run_id=?{window_filter} ORDER BY window_start,signal_type",
+        params,
+    ).fetchall()
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if event_table == "live_events":
+            query = """SELECT e.id,e.event_id AS stable_event_id,e.event_type,e.event_time,e.user_name,e.content,e.metadata_json
+                       FROM signal_evidence se JOIN live_events e ON e.id=se.event_id
+                       WHERE se.signal_id=? AND e.session_id=? ORDER BY e.id"""
+        else:
+            query = """SELECT e.id,e.event_type,e.event_time,e.uname,e.text,e.gift_name
+                       FROM signal_evidence se JOIN events e ON e.id=se.event_id
+                       WHERE se.signal_id=? AND e.session_id=? ORDER BY e.id"""
+        evidence_rows = connection.execute(query, (row["signal_id"], session_id)).fetchall()
+        item["evidence"] = [_public_evidence_row(evidence, event_table, provider) for evidence in evidence_rows]
+        feedback = connection.execute(
+            "SELECT feedback_type,COUNT(*) AS count FROM signal_feedback WHERE signal_id=? GROUP BY feedback_type",
+            (row["signal_id"],),
+        ).fetchall()
+        item["feedback"] = {feedback_row["feedback_type"]: int(feedback_row["count"]) for feedback_row in feedback}
+        result.append(item)
+    return result
+
+
+def add_signal_feedback(connection: sqlite3.Connection, signal_id: str, feedback_type: str, note: Optional[str] = None, created_at: Optional[str] = None) -> Dict[str, Any]:
+    if feedback_type not in {"useful", "false_positive", "note"}:
+        raise SignalFeedbackError("unsupported feedback type")
+    if feedback_type == "note" and not str(note or "").strip():
+        raise SignalFeedbackError("note feedback requires a note")
+    if not connection.execute("SELECT 1 FROM signals WHERE signal_id=?", (signal_id,)).fetchone():
+        raise SignalFeedbackError("signal does not exist")
+    record = {
+        "feedback_id": "fb_" + uuid.uuid4().hex,
+        "signal_id": signal_id,
+        "feedback_type": feedback_type,
+        "note": str(note).strip() if note is not None else None,
+        "created_at": _as_utc_text(created_at or utc_now()),
+    }
+    try:
+        connection.execute(
+            "INSERT INTO signal_feedback(feedback_id,signal_id,feedback_type,note,created_at) VALUES(?,?,?,?,?)",
+            tuple(record[key] for key in ("feedback_id", "signal_id", "feedback_type", "note", "created_at")),
+        )
+        connection.commit()
+    except sqlite3.IntegrityError as error:
+        connection.rollback()
+        raise SignalFeedbackError(str(error)) from error
+    return record
+
+
 class SignalEngine:
     def __init__(self, analyzer=analyze_text) -> None:
         self.analyzer = analyzer
 
     @staticmethod
-    def _window(events: Sequence[Dict[str, Any]], seconds: int) -> List[Dict[str, Any]]:
-        cutoff = time.time() - seconds
-        return [event for event in events if event_seconds(event.get("timestamp")) >= cutoff]
+    def _window(events: Sequence[Dict[str, Any]], seconds: int, as_of: Optional[str] = None) -> List[Dict[str, Any]]:
+        cutoff = event_seconds(as_of) - seconds if as_of else time.time() - seconds
+        end = event_seconds(as_of) if as_of else float("inf")
+        return [event for event in events if cutoff <= event_seconds(_event_timestamp(event)) < end]
 
     @staticmethod
     def _rate(count: int, seconds: int) -> float:
@@ -712,11 +1065,25 @@ class SignalEngine:
     def _ratio(count: int, total: int) -> float:
         return round(count / total, 3) if total else 0.0
 
-    def build(self, events: Sequence[Dict[str, Any]], online: Optional[int] = None, snapshots: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def build(
+        self,
+        events: Sequence[Dict[str, Any]],
+        online: Optional[int] = None,
+        snapshots: Optional[Sequence[Dict[str, Any]]] = None,
+        *,
+        provider: str = "fixture",
+        room_id: str = "fixture",
+        session_id: Optional[int] = None,
+        run_id: str = "replay",
+        as_of: Optional[str] = None,
+        coverage: str = "reliable_with_data",
+        previous: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         recent = list(events)
+        reference_time = as_of or utc_now()
         windows: Dict[str, Dict[str, Any]] = {}
         for seconds, label in ((10, "10s"), (60, "60s"), (300, "5m")):
-            window = self._window(recent, seconds)
+            window = self._window(recent, seconds, reference_time)
             comments = [event for event in window if event.get("type") == "comment"]
             likes = sum(1 for event in window if event.get("type") == "like")
             gifts = sum(1 for event in window if event.get("type") == "gift")
@@ -742,7 +1109,7 @@ class SignalEngine:
                 "negative_ratio": self._ratio(negative, len(comments)), "heat_score": round(heat, 1),
             }
 
-        five_minute = self._window(recent, 300)
+        five_minute = self._window(recent, 300, reference_time)
         comments_5m = [event for event in five_minute if event.get("type") == "comment"]
         topics = Counter(event.get("topic", "other") for event in comments_5m)
         questions = Counter(re.sub(r"[\s！？?!。,.，、]+", "", str(event.get("content") or "")) for event in comments_5m if event.get("content") and (event.get("is_question") == "true" or "?" in str(event.get("content")) or "？" in str(event.get("content"))))
@@ -753,17 +1120,28 @@ class SignalEngine:
                     keywords[token] += 1
 
         signals: List[Dict[str, Any]] = []
+        if session_id is not None:
+            signals = evaluate_signal_window(
+                recent, provider=provider, room_id=room_id, session_id=session_id,
+                run_id=run_id, as_of=reference_time, coverage=coverage, previous=previous,
+            )
+        if not signals and session_id is None:
+            signals = []
+        if signals:
+            legacy_signals = signals
+        else:
+            legacy_signals = []
         current = windows["60s"]
-        if current["high_purchase_ratio"] >= 0.2 and current["comments"] >= 2:
-            signals.append({"level": "opportunity", "title": "购买意图集中", "detail": "价格、下单或购买方式相关问题正在出现。", "recommendation": "主播重复价格、优惠和下单路径。"})
-        if current["negative_ratio"] >= 0.25 and current["comments"] >= 3:
-            signals.append({"level": "risk", "title": "负面情绪升高", "detail": "负面评论占比超过最近评论的四分之一。", "recommendation": "优先回应物流、售后或产品疑虑，并给出明确处理时效。"})
+        if session_id is None:
+            if current["high_purchase_ratio"] >= 0.2 and current["comments"] >= 2:
+                legacy_signals.append({"level": "opportunity", "title": "购买意图集中", "detail": "价格、下单或购买方式相关问题正在出现。", "recommendation": "主播重复价格、优惠和下单路径。"})
+            if current["negative_ratio"] >= 0.25 and current["comments"] >= 3:
+                legacy_signals.append({"level": "risk", "title": "负面情绪升高", "detail": "负面评论占比超过最近评论的四分之一。", "recommendation": "优先回应物流、售后或产品疑虑，并给出明确处理时效。"})
         if questions:
             top_question = questions.most_common(1)[0][0]
             if top_question:
-                signals.append({"level": "attention", "title": "观众问题集中", "detail": "高频问题：" + top_question, "recommendation": "把该问题整理成一句固定口播或屏幕贴片。"})
-        if not signals:
-            signals.append({"level": "neutral", "title": "暂无强信号", "detail": "继续积累事件，等待趋势变化。", "recommendation": "保持观察评论速度、购买意图和负面反馈。"})
+                if session_id is None:
+                    legacy_signals.append({"level": "attention", "title": "观众问题集中", "detail": "高频问题：" + top_question, "recommendation": "把该问题整理成一句固定口播或屏幕贴片。"})
 
         return {
             "windows": windows,
@@ -771,7 +1149,7 @@ class SignalEngine:
             "topics": [{"topic": key, "label": TOPIC_LABELS.get(key, key), "count": value} for key, value in topics.most_common(6)],
             "keywords": [[key, value] for key, value in keywords.most_common(12)],
             "hot_questions": [{"question": key, "count": value} for key, value in questions.most_common(5) if key],
-            "signals": signals,
+            "signals": legacy_signals,
             "summary": {
                 "top_topics": [TOPIC_LABELS.get(key, key) for key, _ in topics.most_common(3)],
                 "purchase_intent": current["purchase_ratio"],

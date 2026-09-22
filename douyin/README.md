@@ -86,7 +86,9 @@ curl -X POST http://127.0.0.1:4173/api/disconnect \
   -H 'Content-Type: application/json' -d '{}'
 ```
 
-`/api/events` 的事件会包含 `event_id、room_id、timestamp、type、user、content、metadata、topic、intent、sentiment、purchase_intent`。当前分析为规则优先，分析器和 Store 都是可替换边界，后续可以接 LLM、Redis、PostgreSQL 或 SSE/WebSocket。
+`/api/events` 的事件会包含 `event_id、room_id、timestamp、type、user、content、metadata、topic、intent、sentiment、purchase_intent`。当前分析为规则优先，`rules-v2` 不使用 LLM：明确否定优先，引用/转述不升级为强信号；信号还必须满足事件数和独立用户数门槛，并携带规则版本、窗口、coverage、事实原因和证据。
+
+规则信号通过 `/api/snapshot` 的 `metrics.signals` 返回。当前最小门槛是最近 60 秒内至少 2 条命中消息、至少 2 个独立用户；同一用户刷屏不会满足独立用户门槛。`gap` 或 `unknown` coverage 不会产生强信号，重复计算同一窗口使用稳定 `signal_id` 幂等保存。用户可以调用 `POST /api/signals/feedback`，提交 `useful`、`false_positive` 或带非空 `note` 的备注；反馈不会自动改变规则。
 
 ## 采集边界
 

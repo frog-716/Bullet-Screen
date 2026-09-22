@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from live_intelligence import EventConflictError, LiveEventStore, SignalEngine, china_timestamp, normalize_event, safe_int, utc_now
+from live_intelligence import EventConflictError, LiveEventStore, SignalEngine, _window_bounds, china_timestamp, load_signals, normalize_event, persist_signal, safe_int, utc_now
 
 try:
     import brotli  # type: ignore
@@ -1188,7 +1188,31 @@ class DouyinCollector:
         session_id = self.data_session_id() if current["connected"] else None
         events = self.store.recent_events(session_id, limit=None, since=datetime.fromtimestamp(time.time() - 300, timezone.utc).isoformat()) if session_id else []
         snapshots = self.store.recent_snapshots(session_id, 60) if session_id else []
-        analysis = self.signals.build(events, current["online"] if current["connected"] else None, snapshots)
+        reference = utc_now()
+        coverage = {"coverage_state": "unknown"}
+        if session_id and current.get("run_id"):
+            start, end = snapshot_window(reference, 60)
+            coverage = self.store.coverage(session_id, start, end)
+        if session_id and current.get("run_id"):
+            with self.store.lock:
+                previous = load_signals(self.store.connection, session_id, self.provider_name, self.room_id, current["run_id"], "live_events")
+        else:
+            previous = []
+        analysis = self.signals.build(
+            events, current["online"] if current["connected"] else None, snapshots,
+            provider=self.provider_name, room_id=self.room_id, session_id=session_id,
+            run_id=current.get("run_id") or "inactive", as_of=reference,
+            coverage=coverage.get("coverage_state", "unknown"), previous=previous,
+        )
+        if session_id and current.get("run_id"):
+            with self.store.lock:
+                for signal in analysis.get("signals", []):
+                    persist_signal(self.store.connection, signal, "live_events")
+                window_start, window_end = _window_bounds(reference, 60)
+                analysis["signals"] = load_signals(
+                    self.store.connection, session_id, self.provider_name, self.room_id,
+                    current["run_id"], "live_events", window_start, window_end,
+                )
         current_window = analysis["current"]
         return {
             **current, **analysis,
@@ -1254,6 +1278,8 @@ class DouyinCollector:
                     "as_of": as_of,
                     "last_valid_at": last_valid_at,
                 }
+                snapshot_signals = [{**signal, "generation": context.generation if context else 0} for signal in metrics.get("signals", [])]
+                metrics["signals"] = snapshot_signals
                 return {
                     "provider": "douyin",
                     "room_id": room_id,
@@ -1274,6 +1300,7 @@ class DouyinCollector:
                     },
                     "coverage": coverage,
                     "metrics": metrics,
+                    "signals": snapshot_signals,
                     "events": {
                         "items": events,
                         "session_id": session_id,

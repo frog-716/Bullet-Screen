@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from douyin_adapter import BusyError, DouyinCollector, SnapshotUnstableError, _decode_im_event, _decode_im_response, parse_room_input, snapshot_window, snapshot_window_seconds
-from live_intelligence import analyze_text, normalize_event
+from live_intelligence import SignalEngine, SignalFeedbackError, _window_bounds, add_signal_feedback, analyze_text, load_signals, normalize_event, persist_signal
 
 
 ROOT = Path(__file__).resolve().parent
@@ -45,9 +45,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from schema_v4 import SCHEMA_VERSION as V4_SCHEMA_VERSION, V4_TABLES, create_signal_schema, verify_signal_schema
 
 DEFAULT_DB = ROOT / "data" / "danmaku.sqlite3"
-STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/snapshot_client.js": "snapshot_client.js", "/styles.css": "styles.css"}
+STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/snapshot_client.js": "snapshot_client.js", "/signal_ui.js": "signal_ui.js", "/styles.css": "styles.css"}
 PUBLIC_API_PATHS = {"/api/health", "/api/bootstrap"}
-PROTECTED_API_PATHS = {"/api/status", "/api/metrics", "/api/events", "/api/snapshot", "/api/connect", "/api/disconnect"}
+PROTECTED_API_PATHS = {"/api/status", "/api/metrics", "/api/events", "/api/snapshot", "/api/connect", "/api/disconnect", "/api/signals/feedback"}
 MAX_REQUEST_BYTES = 64 * 1024
 REQUEST_TIMEOUT_SECONDS = 10.0
 FRESHNESS_TIMEOUT_SECONDS = 45.0
@@ -792,10 +792,12 @@ class EventStore:
             limit_sql = " LIMIT ?"
             params.append(max(safe_int(limit, 100), 1))
         with self.lock:
-            rows = self.connection.execute(f"SELECT event_time,event_type,uid,uname,text,gift_name,gift_num,amount,popularity FROM events{where} ORDER BY id DESC{limit_sql}", params).fetchall()
+            rows = self.connection.execute(f"SELECT id,event_time,event_type,uid,uname,text,gift_name,gift_num,amount,popularity FROM events{where} ORDER BY id DESC{limit_sql}", params).fetchall()
         result = []
         for row in reversed(rows):
             item = dict(row)
+            item["_db_event_id"] = int(item.pop("id"))
+            item["event_id"] = f"bilibili:event:{item['_db_event_id']}"
             if item.get("event_type") == "gift":
                 item["value_contract"] = {
                     "quantity": item.get("gift_num"), "quantity_unit": "item",
@@ -994,6 +996,7 @@ class Collector:
 
     def __init__(self, store: EventStore) -> None:
         self.store = store
+        self.signals = SignalEngine()
         self.command_lock = threading.RLock()
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -1140,9 +1143,36 @@ class Collector:
                         gift_quantity += max(safe_int(row.get("gift_num")), 0)
             trend = self.store.recent_snapshots(session_id, 60)
             current = self.status()
+            signal_records: List[Dict[str, Any]] = []
+            if session_id and current.get("run_id"):
+                reference = utc_now()
+                start, end = snapshot_window(reference, 60)
+                coverage = self.store.coverage(session_id, start, end)
+                with self.store.lock:
+                    previous = load_signals(self.store.connection, session_id, self.provider_name, self.room_id, current["run_id"], "events")
+                normalized_events = []
+                for row in rows:
+                    if row.get("event_type") != "danmaku":
+                        continue
+                    normalized_events.append({
+                        "event_id": row.get("event_id"), "_db_event_id": row.get("_db_event_id"),
+                        "type": "comment", "timestamp_utc": row.get("event_time"),
+                        "user_id": row.get("uid"), "user_name": row.get("uname"),
+                        "content": row.get("text") or "", "analysis": analyze_text(row.get("text") or ""),
+                    })
+                analysis = self.signals.build(
+                    normalized_events, current.get("online"), trend,
+                    provider=self.provider_name, room_id=self.room_id, session_id=session_id,
+                    run_id=current["run_id"], as_of=reference, coverage=coverage["coverage_state"], previous=previous,
+                )
+                with self.store.lock:
+                    for signal in analysis.get("signals", []):
+                        persist_signal(self.store.connection, signal, "events")
+                    window_start, window_end = _window_bounds(reference, 60)
+                    signal_records = load_signals(self.store.connection, session_id, self.provider_name, self.room_id, current["run_id"], "events", window_start, window_end)
             if current["connected"]:
                 trend.append({"recorded_at": utc_now(), "online": current["online"], "likes": current["likes"], "danmaku_rate": current["rate"], "total_danmaku": current["total"]})
-            return {**current, "ranking": sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:10], "keywords": sorted(keywords.items(), key=lambda item: item[1], reverse=True)[:10], "gift_quantity": gift_quantity, "revenue": None, "revenue_currency": None, "revenue_semantics": "unknown_currency_not_estimated", "trend": trend}
+            return {**current, "ranking": sorted(ranking.items(), key=lambda item: item[1], reverse=True)[:10], "keywords": sorted(keywords.items(), key=lambda item: item[1], reverse=True)[:10], "gift_quantity": gift_quantity, "revenue": None, "revenue_currency": None, "revenue_semantics": "unknown_currency_not_estimated", "trend": trend, "signals": signal_records}
 
     def snapshot(self, window: Any = "300s", limit: int = 100) -> Dict[str, Any]:
         seconds = snapshot_window_seconds(window)
@@ -1200,6 +1230,8 @@ class Collector:
                     "as_of": as_of,
                     "last_valid_at": last_valid_at,
                 }
+                snapshot_signals = [{**signal, "generation": context.generation if context else 0} for signal in metrics.get("signals", [])]
+                metrics["signals"] = snapshot_signals
                 return {
                     "provider": self.provider_name,
                     "room_id": room_id,
@@ -1220,6 +1252,7 @@ class Collector:
                     },
                     "coverage": coverage,
                     "metrics": metrics,
+                    "signals": snapshot_signals,
                     "events": {
                         "items": events,
                         "session_id": session_id,
@@ -1644,11 +1677,23 @@ class AppHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if not self._authorize_api(parsed.path):
             return
-        if parsed.path not in ("/api/connect", "/api/disconnect"):
+        if parsed.path not in ("/api/connect", "/api/disconnect", "/api/signals/feedback"):
             return
         try:
             payload = self._read_json_body()
-            if parsed.path == "/api/connect":
+            if parsed.path == "/api/signals/feedback":
+                signal_id = str(payload.get("signal_id") or "").strip()
+                feedback_type = str(payload.get("feedback_type") or "").strip()
+                if not signal_id:
+                    self._send_json({"error": "signal_id is required"}, 400)
+                    return
+                try:
+                    feedback = add_signal_feedback(self.collector.store.connection, signal_id, feedback_type, payload.get("note"))
+                except SignalFeedbackError as error:
+                    self._send_json({"error": str(error)}, 400)
+                    return
+                self._send_json({"feedback": feedback}, 201)
+            elif parsed.path == "/api/connect":
                 room_input = str(payload.get("url") or payload.get("room_id") or "").strip()
                 if not room_input:
                     self._send_json({"error": "请提供抖音直播间 URL 或 room_id"}, 400)
@@ -1760,7 +1805,7 @@ def run_self_test() -> None:
         time.sleep(2.4)
         demo_metrics = douyin.metrics()
         assert demo_metrics["provider"] == "douyin" and demo_metrics["current"]["comments"] >= 1
-        assert demo_metrics["signals"] and douyin.recent_events(20)
+        assert isinstance(demo_metrics["signals"], list) and douyin.recent_events(20)
         douyin.stop()
     print("self-test: PASS (sqlite, Bilibili codec, Douyin fetch protobuf, event analysis)")
 

@@ -48,8 +48,10 @@ python3 server.py
 - `events`：原始业务事件
 - `metric_snapshots`：B 站热度值、点赞事件和弹幕速率快照
 - `capture_gaps`：采集缺口
-- `signals`、`signal_evidence`、`signal_feedback`：v4 信号存储基础；本阶段只建立空表，不自动生成历史信号
+- `signals`、`signal_evidence`、`signal_feedback`：v4 规则信号、证据回链和人工反馈；不会根据旧事件自动脑补历史信号
 
 SQLite 文件被 `.gitignore` 排除，凭证不会进入仓库。
+
+当前规则信号通过 `/api/snapshot` 的 `signals` 和 `metrics.signals` 返回；`rules-v2` 只使用保守、可回放的本地规则。反馈通过受保护的 `POST /api/signals/feedback` 提交 `useful`、`false_positive` 或带非空 `note` 的评价。
 
 当前 `events` 只保留看板和指标实际使用的字段：事件类型、时间、用户、文本、礼物、金额和 B 站热度值；原始 JSON 包和重复接收时间不再写入。

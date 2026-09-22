@@ -57,7 +57,7 @@ Douyin 真实浏览器模式默认使用 `douyin/data/browser-profile/` 持久 P
 
 coverage API 区分四种状态：`reliable_with_data`（窗口完整且有事件）、`reliable_no_events`（有可靠采集证据但窗口内无事件）、`gap`（窗口与采集缺口重叠）和 `unknown`（没有足够证据判断完整性）。`unknown/null` 不等于数字 `0`；礼物数量、平台原始金额、币种和估算收入分别保留，不能互相替代。
 
-v4 的 `signals` 只保存规则推断本身，`signal_evidence` 通过对应数据库的事件行主键建立外键，`signal_feedback` 保存多条人工评价；`signal_id` 由 provider、room、session、run、规则版本、信号类型和时间窗口稳定生成。v3 → v4 不会自动从历史事件生成 signal。
+v4 的 `signals` 保存规则推断本身，`signal_evidence` 通过对应数据库的事件行主键建立外键，`signal_feedback` 保存多条人工评价；`signal_id` 由 provider、room、session、run、规则版本、信号类型和时间窗口稳定生成。v3 → v4 不会自动从历史事件生成 signal。当前 `rules-v2` 只做保守候选提取：明确否定优先，引用/转述标记为不确定，不使用 LLM 或概率模型；强信号还必须同时满足事件数和独立用户数门槛，并受 coverage 约束。
 
 当前数据库只保留看板实际读取的字段：B 站事件移除了未使用的 `received_at`、`raw_json`；抖音事件移除了未使用的 `received_at`。早期误写入 B 站库的 `live_*` 抖音表已迁移到 `douyin/data/danmaku.sqlite3`，再从 B 站库删除。
 
