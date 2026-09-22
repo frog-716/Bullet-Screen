@@ -16,28 +16,28 @@ DouyinPublicAdapter（Playwright `/webcast/im/fetch/` protobuf / DOM fallback）
 
 ## 快速运行
 
-Python 3.9+、核心链路零第三方依赖：
+Python 3.9+；本批已在 Python 3.9.6 上实际验证。核心链路和 Bilibili 兼容入口只用标准库；Douyin 真实浏览器模式的受控依赖见项目根目录的 `requirements-douyin.txt`。新 Mac 优先按项目根目录 README 的 `./scripts/setup.sh → doctor → build → smoke` 路线安装。
 
 ```bash
-python3 server.py --self-test
-python3 server.py --mode demo
+../.venv/bin/python server.py --self-test
+../.venv/bin/python server.py --mode demo
 ```
 
 打开 <http://127.0.0.1:4173/>，在“观察设置”输入任意数字 room_id，选择“本地演示”，即可离线看到评论、点赞、礼物、关注、分享、在线人数、热词、情绪和运营信号。
 
 `demo` 服务使用内存数据库，退出即清空；真实服务拒绝临时切换到 `demo`，演示事件不会再混入 `data/danmaku.sqlite3`。
 
-真实浏览器采集需要项目根目录的 `.venv` 安装 Playwright：
+真实浏览器采集需要项目根目录的 `.venv` 安装 Playwright、Brotli 和 stealth helper。setup 会安装当前受控版本并准备 Chromium：
 
 ```bash
-.venv/bin/python -m pip install playwright brotli playwright-stealth
+.venv/bin/python -m pip install --requirement requirements-douyin.txt
 .venv/bin/python -m playwright install chromium
 # 推荐：提升抖音页面在自动化浏览器中的可见内容稳定性
 .venv/bin/python douyin/login.py
 .venv/bin/python douyin/server.py --mode auto
 ```
 
-首次运行先执行 `douyin/login.py`。它会打开抖音直播首页；请在该窗口完成扫码或手机号登录，然后关闭整个浏览器窗口。登录态只保存在本机 `douyin/data/browser-profile/`，该目录被 Git 忽略，不需要复制或发送 Cookie。采集器默认复用此登录目录并显示浏览器窗口。这个持久 Profile 会保留浏览器登录态和 Cookie；它与页面中手工输入的 Cookie 只在服务进程内存中使用是两件事，停止采集不会自动清除 Profile。
+首次需要登录时执行 `.venv/bin/python douyin/login.py`。它会打开抖音直播首页；请在该窗口完成扫码或手机号登录，然后关闭整个浏览器窗口。登录态只保存在本机 `douyin/data/browser-profile/`，该目录被 Git 忽略，不需要复制或发送 Cookie。采集器默认复用此登录目录并显示浏览器窗口。这个持久 Profile 会保留浏览器登录态和 Cookie；它与页面中手工输入的 Cookie 只在服务进程内存中使用是两件事，停止采集不会自动清除登录态。
 
 该 Profile 可能占用 100 MB 以上的本地空间，主要是可重建的 Chromium 缓存；Cookie 与登录状态本身很小。启动参数已把后续磁盘缓存限制在约 50 MB、媒体缓存限制在约 10 MB。目录不需要手工打开，只有登录失效时才重新运行 `login.py`；但采集期间浏览器引擎和目标直播页必须保持运行。当前抖音页面在本机 `headless` 模式会停止持续拉取事件，因此真实验收默认使用可见窗口，断开采集后窗口自动关闭。
 
@@ -64,6 +64,8 @@ DOUYIN_USER_AGENT="Mozilla/5.0 ... Chrome/148.0.0.0 Safari/537.36" \
 ```
 
 如果页面只停留在骨架页，采集器会返回明确错误，不再伪装成已连接；需要时可使用 `DOUYIN_HEADLESS=0` 和 `DOUYIN_PROFILE_DIR` 复用本机浏览器环境。
+
+如果看板显示“页面已打开 · 等待协议采集”或“协议采集不可用”，页面加载并不代表当前房间可采集。先确认直播正在播放、登录状态有效，必要时重新运行 `login.py` 或换一个公开房间。当前并非所有 Douyin 房间都保证可采集，也不承诺 WebSocket binary transport。
 
 页面中手工输入的 Cookie 只在本地服务进程内存中使用，不写入 SQLite、日志或 `/api/status`；真实浏览器登录态仍由持久 Profile 保存。看板通过同源 `/api/bootstrap` 获取本次服务启动的浏览器调用边界令牌，并在内存中通过 `X-Bullet-Screen-Token` 调用 `/api/status`、`/api/metrics`、`/api/events`、`/api/connect` 和 `/api/disconnect`；该令牌用于同源/跨站请求和 CSRF 类防护，不是防御同机恶意程序的认证系统。令牌不放入 URL、SQLite 或日志。请自行遵守抖音服务条款、账号权限和适用法律法规。
 

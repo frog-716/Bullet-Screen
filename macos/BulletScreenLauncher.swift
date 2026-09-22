@@ -3,6 +3,8 @@ import Cocoa
 private final class ActiveRun {
     let identity: LaunchRunIdentity
     let provider: String
+    let roomInput: String?
+    let demoMode: Bool
     let process: Process
     let stdout: Pipe
     let stderr: Pipe
@@ -16,9 +18,11 @@ private final class ActiveRun {
     var pendingStopMessage: String?
     var pageOpened = false
 
-    init(identity: LaunchRunIdentity, provider: String, process: Process, stdout: Pipe, stderr: Pipe) {
+    init(identity: LaunchRunIdentity, provider: String, roomInput: String?, demoMode: Bool, process: Process, stdout: Pipe, stderr: Pipe) {
         self.identity = identity
         self.provider = provider
+        self.roomInput = roomInput
+        self.demoMode = demoMode
         self.process = process
         self.stdout = stdout
         self.stderr = stderr
@@ -28,7 +32,11 @@ private final class ActiveRun {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private let providerControl = NSSegmentedControl(labels: ["Bilibili", "抖音"], trackingMode: .selectOne, target: nil, action: nil)
-    private let demoControl = NSButton(checkboxWithTitle: "抖音使用本地演示模式", target: nil, action: nil)
+    private let roomInputField = NSTextField()
+    private let roomHelpLabel = NSTextField(wrappingLabelWithString: "")
+    private let demoButton = NSButton(title: "先试 Demo（不需要账号）", target: nil, action: nil)
+    private let loginButton = NSButton(title: "登录 Douyin", target: nil, action: nil)
+    private let doctorButton = NSButton(title: "检查安装环境", target: nil, action: nil)
     private let startButton = NSButton(title: "启动看板", target: nil, action: nil)
     private let stopButton = NSButton(title: "停止服务", target: nil, action: nil)
     private let statusLabel = NSTextField(wrappingLabelWithString: "选择平台后启动看板。")
@@ -36,6 +44,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var projectRoot: URL?
     private let lifecycle = LauncherLifecycleModel()
     private var activeRun: ActiveRun?
+    private var loginProcess: Process?
+    private var launchDemoRequested = false
     private var preflightInProgress = false
     private var applicationTerminationRequested = false
     private let readyTimeout: TimeInterval = 10
@@ -45,10 +55,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
         projectRoot = resolveProjectRoot()
-        if let projectRoot {
-            setStatus("已绑定项目：\(projectRoot.lastPathComponent)")
+        if projectRoot != nil {
+            setStatus("已找到项目。请选择平台，输入直播间链接或房间号；也可以先试 Demo。")
         } else {
-            setStatus("请选择 Bullet-Screen 项目目录后再启动看板。", error: true)
+            setStatus("请选择 Bullet-Screen 项目文件夹。", error: true)
         }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -69,13 +79,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         activeRun?.stdout.fileHandleForReading.readabilityHandler = nil
         activeRun?.stderr.fileHandleForReading.readabilityHandler = nil
+        loginProcess?.terminate()
     }
 
     private func buildWindow() {
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 390),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 560),
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered,
                           defer: false)
@@ -87,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let title = NSTextField(labelWithString: "直播弹幕看板")
         title.font = NSFont.systemFont(ofSize: 30, weight: .bold)
 
-        let subtitle = NSTextField(wrappingLabelWithString: "选择平台后，Bullet-Screen 会启动对应的本地采集服务，并打开看板页面。")
+        let subtitle = NSTextField(wrappingLabelWithString: "选择平台，填入直播间，点击开始。第一次使用也可以先试 Demo。")
         subtitle.textColor = .secondaryLabelColor
         subtitle.font = NSFont.systemFont(ofSize: 14)
 
@@ -98,15 +109,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         providerControl.target = self
         providerControl.action = #selector(providerChanged)
 
-        demoControl.state = .off
-        demoControl.font = NSFont.systemFont(ofSize: 12)
-        demoControl.target = self
-        demoControl.action = #selector(providerChanged)
+        let platformHelp = NSTextField(wrappingLabelWithString: "Bilibili：可以直接尝试连接公开直播间。\nDouyin：需要额外的浏览器环境，部分房间可能只能打开页面，暂时读不到互动数据。")
+        platformHelp.textColor = .secondaryLabelColor
+        platformHelp.font = NSFont.systemFont(ofSize: 12)
+        platformHelp.preferredMaxLayoutWidth = 540
+
+        let roomLabel = NSTextField(labelWithString: "直播间链接或房间号")
+        roomLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        roomInputField.placeholderString = "例如：123456 或直播间链接"
+        roomInputField.font = NSFont.systemFont(ofSize: 14)
+        roomHelpLabel.textColor = .secondaryLabelColor
+        roomHelpLabel.font = NSFont.systemFont(ofSize: 12)
+        roomHelpLabel.preferredMaxLayoutWidth = 540
 
         startButton.keyEquivalent = "\r"
         startButton.bezelStyle = .rounded
         startButton.target = self
         startButton.action = #selector(startSelectedProvider)
+
+        demoButton.bezelStyle = .rounded
+        demoButton.target = self
+        demoButton.action = #selector(startDemo)
+
+        loginButton.bezelStyle = .rounded
+        loginButton.target = self
+        loginButton.action = #selector(loginDouyin)
+
+        doctorButton.bezelStyle = .rounded
+        doctorButton.target = self
+        doctorButton.action = #selector(runDoctor)
 
         stopButton.bezelStyle = .rounded
         stopButton.target = self
@@ -117,11 +148,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLabel.maximumNumberOfLines = 3
         statusLabel.preferredMaxLayoutWidth = 500
 
-        let actionRow = NSStackView(views: [startButton, stopButton])
+        let actionRow = NSStackView(views: [startButton, demoButton, stopButton])
         actionRow.orientation = .horizontal
         actionRow.spacing = 10
 
-        let stack = NSStackView(views: [title, subtitle, providerLabel, providerControl, demoControl, actionRow, statusLabel])
+        let helpRow = NSStackView(views: [loginButton, doctorButton])
+        helpRow.orientation = .horizontal
+        helpRow.spacing = 10
+
+        let stack = NSStackView(views: [title, subtitle, providerLabel, providerControl, platformHelp, roomLabel, roomInputField, roomHelpLabel, actionRow, helpRow, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
@@ -135,18 +170,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -28),
             providerControl.widthAnchor.constraint(equalToConstant: 230),
             providerControl.heightAnchor.constraint(equalToConstant: 30),
-            statusLabel.widthAnchor.constraint(equalToConstant: 490)
+            roomInputField.widthAnchor.constraint(equalToConstant: 540),
+            roomInputField.heightAnchor.constraint(equalToConstant: 30),
+            statusLabel.widthAnchor.constraint(equalToConstant: 540)
         ])
         providerChanged()
     }
 
     @objc private func providerChanged() {
         let isDouyin = providerControl.selectedSegment == 1
-        demoControl.isHidden = !isDouyin
+        loginButton.isHidden = !isDouyin
         startButton.title = isDouyin ? "启动抖音看板" : "启动 Bilibili 看板"
+        roomInputField.placeholderString = isDouyin
+            ? "例如：511304254586 或 https://live.douyin.com/511304254586"
+            : "例如：123456 或 https://live.bilibili.com/123456"
+        roomHelpLabel.stringValue = isDouyin
+            ? "Douyin 真实模式可能需要登录。没有直播间也可以点“先试 Demo”。"
+            : "Bilibili 支持房间号或正常直播间链接；需要登录时再按错误提示处理。"
+    }
+
+    @objc private func startDemo() {
+        launchDemoRequested = true
+        providerControl.selectedSegment = 1
+        providerChanged()
+        startSelectedProvider()
+    }
+
+    @objc private func runDoctor() {
+        guard loginProcess == nil, !preflightInProgress else { return }
+        if projectRoot == nil {
+            projectRoot = chooseProjectRoot()
+        }
+        guard let root = projectRoot else {
+            setStatus("请先选择 Bullet-Screen 项目文件夹。", error: true)
+            return
+        }
+        guard let python = findPython(in: root) else {
+            showEnvironmentAlert(title: "还不能检查", message: "找不到 Python 3.9+。请先安装 Python，再运行 setup。")
+            return
+        }
+        let doctor = root.appendingPathComponent("scripts/doctor.py")
+        guard FileManager.default.fileExists(atPath: doctor.path) else {
+            showEnvironmentAlert(title: "项目文件不完整", message: "找不到 scripts/doctor.py。请重新下载完整的 Bullet-Screen 项目。")
+            return
+        }
+        setStatus("正在检查安装环境…")
+        let result = LauncherPreflight.runPythonScript(
+            at: python.path,
+            arguments: ["-u", doctor.path, "--root", root.path],
+            currentDirectory: root.path
+        )
+        if result.ok {
+            setStatus("安装环境可以使用。")
+            showEnvironmentAlert(title: "安装环境可以使用", message: "Python、项目入口、Playwright、Chromium 和构建工具检查通过。")
+        } else {
+            setStatus("安装环境还缺东西；请按检查结果处理。", error: true)
+            let detail = result.output.isEmpty ? "请先运行 ./scripts/setup.sh。" : String(result.output.suffix(1400))
+            showEnvironmentAlert(title: "安装环境需要处理", message: "请先运行 ./scripts/setup.sh。\n\n\(detail)")
+        }
+    }
+
+    @objc private func loginDouyin() {
+        guard loginProcess == nil, !preflightInProgress else { return }
+        if projectRoot == nil {
+            projectRoot = chooseProjectRoot()
+        }
+        guard let root = projectRoot else {
+            setStatus("请先选择 Bullet-Screen 项目文件夹。", error: true)
+            return
+        }
+        guard let python = findPython(in: root) else {
+            setStatus("找不到 Python 3.9+。请先运行 setup。", error: true)
+            return
+        }
+        let loginScript = root.appendingPathComponent("douyin/login.py")
+        guard FileManager.default.fileExists(atPath: loginScript.path) else {
+            setStatus("找不到 Douyin 登录助手。请确认项目文件完整。", error: true)
+            return
+        }
+        let process = Process()
+        process.executableURL = python
+        process.arguments = ["-u", loginScript.path]
+        process.currentDirectoryURL = root.appendingPathComponent("douyin", isDirectory: true)
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        process.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.loginProcess = nil
+                self?.loginButton.isEnabled = true
+                self?.setStatus("Douyin 登录助手已结束。登录完成后，可以输入直播间再启动。")
+            }
+        }
+        do {
+            try process.run()
+            loginProcess = process
+            loginButton.isEnabled = false
+            setStatus("已打开 Douyin 登录窗口。请在窗口中完成登录，再关闭窗口。")
+        } catch {
+            setStatus("Douyin 登录助手启动失败：\(error.localizedDescription)", error: true)
+        }
+    }
+
+    private func showEnvironmentAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = title.contains("可以") ? .informational : .warning
+        alert.addButton(withTitle: "知道了")
+        alert.runModal()
     }
 
     @objc private func startSelectedProvider() {
+        let demoMode = launchDemoRequested
+        launchDemoRequested = false
         guard !preflightInProgress else { return }
         guard lifecycle.state == .stopped || lifecycle.state == .failed else {
             if lifecycle.state == .stopping {
@@ -166,11 +303,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             projectRoot = chooseProjectRoot()
         }
         guard let root = projectRoot else {
-            failPreflight("尚未选择有效的 Bullet-Screen 项目目录。")
+            failPreflight("请选择 Bullet-Screen 项目文件夹。")
             return
         }
 
         let provider = providerControl.selectedSegment == 1 ? "douyin" : "bilibili"
+        let roomInput = roomInputField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !demoMode && LauncherOnboarding.normalizeRoomInput(provider: provider, raw: roomInput) == nil {
+            failPreflight("请输入直播间链接或房间号。")
+            return
+        }
         let providerRoot = root.appendingPathComponent(provider, isDirectory: true)
         guard LauncherPreflight.hasServer(root: root.path, provider: provider) else {
             failPreflight("找不到 \(provider)/server.py。请确认项目文件完整。")
@@ -178,7 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard let python = findPython(in: root) else {
-            failPreflight("找不到可执行的 Python 3。请安装 Python 3，或设置 BULLET_SCREEN_PYTHON。")
+            failPreflight("找不到 Python 3.9+。请安装支持版本的 Python，再运行 setup。")
             return
         }
 
@@ -194,20 +336,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             failPreflight(pythonError)
             return
         }
-        if provider == "douyin" && demoControl.state != .on,
+        if provider == "douyin" && !demoMode,
            let error = douyinRuntimeError(python) {
             failPreflight(error)
             return
         }
+        let profileAvailable = provider != "douyin" || demoMode || LauncherPreflight.hasDouyinProfile(root: root.path)
 
         let identity = lifecycle.beginStart()!
         let process = Process()
         process.executableURL = python
         var arguments = ["-u", "server.py", "--port", String(port)]
         if provider == "douyin" {
-            arguments += ["--mode", demoControl.state == .on ? "demo" : "auto"]
+            arguments += ["--mode", demoMode ? "demo" : "auto"]
         }
-        if !(provider == "douyin" && demoControl.state == .on),
+        if !demoMode,
            let configuredDatabase = ProcessInfo.processInfo.environment["BULLET_SCREEN_DB"],
            !configuredDatabase.isEmpty {
             let databaseURL = URL(fileURLWithPath: configuredDatabase).standardizedFileURL
@@ -225,7 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
-        let run = ActiveRun(identity: identity, provider: provider, process: process, stdout: stdout, stderr: stderr)
+        let run = ActiveRun(identity: identity, provider: provider, roomInput: roomInput.isEmpty ? nil : roomInput, demoMode: demoMode, process: process, stdout: stdout, stderr: stderr)
         activeRun = run
         process.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
@@ -260,7 +403,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try process.run()
             preflightInProgress = false
             stopButton.isEnabled = true
-            setStatus("正在启动 \(provider == "douyin" ? "抖音" : "Bilibili") 服务，等待 ready…")
+            let loginHint = provider == "douyin" && !demoMode && !profileAvailable ? "；如需登录请点“登录 Douyin”" : ""
+            setStatus("正在启动 \(provider == "douyin" ? "Douyin" : "Bilibili") 服务\(loginHint)，等待服务…")
         } catch {
             handleLaunchFailure(run, message: "进程启动失败：\(error.localizedDescription)")
         }
@@ -431,14 +575,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func pythonRuntimeError(_ python: URL) -> String? {
-        let result = runPythonCheck(python, script: "import sys; print(sys.version.split()[0])")
-        return result.0 ? nil : "Python 无法运行：\(result.1)"
+        let result = runPythonCheck(python, script: "import sys; print(sys.version.split()[0]); raise SystemExit(0 if sys.version_info >= (3, 9) else 1)")
+        return result.0 ? nil : "Python 版本不受支持或无法运行：\(result.1)。请安装 Python 3.9+。"
     }
 
     private func douyinRuntimeError(_ python: URL) -> String? {
         let script = "import os; from playwright.sync_api import sync_playwright; p=sync_playwright().start(); path=p.chromium.executable_path; p.stop(); assert os.path.isfile(path), path; print(path)"
         let result = runPythonCheck(python, script: script)
-        return result.0 ? nil : "抖音真实模式缺少可用的 Playwright/Chromium：\(result.1)"
+        return result.0 ? nil : "Douyin 真实模式缺少 Playwright 或 Chromium。请先运行 ./scripts/setup.sh；也可以先试 Demo。\(result.1.isEmpty ? "" : "（\(result.1)）")"
     }
 
     private func beginReadinessChecks(_ run: ActiveRun) {
@@ -453,7 +597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard activeRun?.identity == run.identity, lifecycle.accepts(run.identity), let port = run.port else { return }
         guard let deadline = run.readinessDeadline else { return }
         guard Date() < deadline else {
-            handleLaunchFailure(run, message: "服务没有在规定时间内 ready。")
+            handleLaunchFailure(run, message: "服务没有在规定时间内 ready。请重试，或点击“检查安装环境”。")
             return
         }
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/api/health")!)
@@ -489,10 +633,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     run.readinessTask = nil
                     _ = self.lifecycle.markReady(run.identity)
                     self.updateControls()
-                    self.setStatus("\(run.provider == "douyin" ? "抖音" : "Bilibili") 服务已 ready · 端口 \(port)")
+                    self.setStatus("运行中：\(run.provider == "douyin" ? "Douyin" : "Bilibili") 看板已打开。")
                     if !run.pageOpened {
                         run.pageOpened = true
-                        NSWorkspace.shared.open(URL(string: "http://127.0.0.1:\(port)/")!)
+                        let dashboard = LauncherOnboarding.dashboardURL(
+                            port: port,
+                            provider: run.provider,
+                            roomInput: run.roomInput,
+                            demo: run.demoMode
+                        ) ?? URL(string: "http://127.0.0.1:\(port)/")!
+                        NSWorkspace.shared.open(dashboard)
                     }
                 } else {
                     self.scheduleReadinessPoll(run)

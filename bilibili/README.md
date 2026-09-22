@@ -8,11 +8,11 @@
 
 ## 运行
 
-Python 3.9+、零第三方依赖：
+Python 3.9+、零第三方依赖；本批已在 Python 3.9.6 上实际验证。新 Mac 优先在项目根目录运行 `./scripts/setup.sh`，再运行 `./.venv/bin/python scripts/doctor.py` 和 `./.venv/bin/python scripts/smoke_test.py`；Node 不是运行时依赖。
 
 ```bash
-python3 server.py --self-test
-python3 server.py
+../.venv/bin/python server.py --self-test
+../.venv/bin/python server.py
 ```
 
 然后打开 <http://127.0.0.1:4173/>。

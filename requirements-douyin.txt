@@ -1,0 +1,4 @@
+# Versions verified in the current macOS environment.
+playwright==1.60.0
+brotli==1.2.0
+playwright-stealth==2.0.3

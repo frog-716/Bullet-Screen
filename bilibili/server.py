@@ -43,7 +43,7 @@ from schema_v4 import SCHEMA_VERSION as V4_SCHEMA_VERSION, V4_TABLES, create_sig
 from douyin.live_intelligence import SignalEngine, SignalFeedbackError, _window_bounds, add_signal_feedback, analyze_text, load_signals, persist_signal
 
 DEFAULT_DB = ROOT / "data" / "danmaku.sqlite3"
-STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/snapshot_client.js": "snapshot_client.js", "/signal_ui.js": "signal_ui.js", "/styles.css": "styles.css"}
+STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/onboarding.js": "onboarding.js", "/snapshot_client.js": "snapshot_client.js", "/signal_ui.js": "signal_ui.js", "/styles.css": "styles.css"}
 PUBLIC_API_PATHS = {"/api/health", "/api/bootstrap"}
 PROTECTED_API_PATHS = {"/api/status", "/api/metrics", "/api/events", "/api/snapshot", "/api/connect", "/api/disconnect", "/api/signals/feedback"}
 MAX_REQUEST_BYTES = 64 * 1024

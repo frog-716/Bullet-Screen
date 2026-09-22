@@ -16,7 +16,7 @@
         <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
         <div class="brand-copy"><strong>BiliDanmaku</strong><span>LIVE OPERATIONS</span></div>
         <div class="top-divider"></div>
-        <div class="room-context"><span class="eyebrow">当前房间</span><strong id="roomTitle">待连接直播间</strong><span class="room-id" id="roomIdLabel"># 7734200</span></div>
+        <div class="room-context"><span class="eyebrow">当前房间</span><strong id="roomTitle">待连接直播间</strong><span class="room-id" id="roomIdLabel">—</span></div>
         <div class="top-actions"><span class="demo-badge"><span class="demo-dot"></span><span id="dataSourceLabel">本地服务 · 无实时数据</span></span><button class="icon-button" id="settingsButton" type="button" aria-label="打开连接设置" title="连接设置">⚙</button><button class="connect-button disconnected" id="connectButton" type="button"><span class="status-dot"></span><span id="connectLabel">服务离线</span></button></div>
       </header>
 
@@ -53,9 +53,10 @@
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <div class="modal-backdrop" id="settingsModal" aria-hidden="true"><section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle"><div class="modal-head"><div><span class="eyebrow">CONNECTION</span><h2 id="settingsTitle">连接设置</h2></div><button class="modal-close" id="closeSettings" type="button" aria-label="关闭">×</button></div><div class="modal-body"><label class="form-label" for="roomInput">B 站房间号</label><div class="input-with-action"><input id="roomInput" value="7734200" inputmode="numeric" /><span>ROOM ID</span></div><p class="form-help">短房间号会在本地服务连接时转换为真实房间号。</p><label class="form-label" for="cookieInput">B 站 Cookie <span>可选</span></label><div class="input-with-action"><input id="cookieInput" type="password" placeholder="可粘贴完整 Cookie，或仅填写 SESSDATA" autocomplete="off" /><button id="toggleCookie" type="button">显示</button></div><p class="form-help warning-help">支持完整浏览器 Cookie 或仅 SESSDATA；只发送到本机服务进程，不写入 SQLite、不进入日志。</p><div class="security-note"><span>✓</span><div><strong>凭证安全</strong><p>浏览器不直连 B 站；Cookie 只在本机服务内存中用于请求，不会提交到远端。</p></div></div></div><div class="modal-actions"><button class="secondary-button" id="cancelSettings" type="button">取消</button><button class="primary-button" id="saveSettings" type="button">保存设置</button></div></section></div>
+    <div class="modal-backdrop" id="settingsModal" aria-hidden="true"><section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle"><div class="modal-head"><div><span class="eyebrow">CONNECTION</span><h2 id="settingsTitle">连接设置</h2></div><button class="modal-close" id="closeSettings" type="button" aria-label="关闭">×</button></div><div class="modal-body"><label class="form-label" for="roomInput">B 站直播间 <span>链接或房间号</span></label><div class="input-with-action"><input id="roomInput" value="" placeholder="https://live.bilibili.com/123456 或 123456" inputmode="url" autocomplete="off" /><span>ROOM</span></div><p class="form-help">支持正常直播间链接或数字房间号；没有输入时不会自动连接任何房间。</p><label class="form-label" for="cookieInput">B 站 Cookie <span>可选</span></label><div class="input-with-action"><input id="cookieInput" type="password" placeholder="可粘贴完整 Cookie，或仅填写 SESSDATA" autocomplete="off" /><button id="toggleCookie" type="button">显示</button></div><p class="form-help warning-help">支持完整浏览器 Cookie 或仅 SESSDATA；只发送到本机服务进程，不写入 SQLite、不进入日志。</p><div class="security-note"><span>✓</span><div><strong>凭证安全</strong><p>浏览器不直连 B 站；Cookie 只在本机服务内存中用于请求，不会提交到远端。</p></div></div></div><div class="modal-actions"><button class="secondary-button" id="cancelSettings" type="button">取消</button><button class="primary-button" id="saveSettings" type="button">保存设置</button></div></section></div>
+    <script src="./onboarding.js?v=20260922-1"></script>
     <script src="./snapshot_client.js?v=20260921-1"></script>
     <script src="./signal_ui.js?v=20260922-1"></script>
-    <script src="./app.js?v=20260921-1"></script>
+    <script src="./app.js?v=20260922-1"></script>
   </body>
 </html>

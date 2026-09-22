@@ -103,9 +103,20 @@ public enum LauncherPreflight {
         return FileManager.default.fileExists(atPath: path.path)
     }
 
+    public static func isProjectRoot(root: String) -> Bool {
+        hasServer(root: root, provider: "bilibili") && hasServer(root: root, provider: "douyin")
+    }
+
     public static func hasDatabaseParent(_ path: String) -> Bool {
         let parent = URL(fileURLWithPath: path).standardizedFileURL.deletingLastPathComponent()
         return FileManager.default.fileExists(atPath: parent.path)
+    }
+
+    public static func hasDouyinProfile(root: String) -> Bool {
+        var isDirectory = ObjCBool(false)
+        let path = URL(fileURLWithPath: root)
+            .appendingPathComponent("douyin/data/browser-profile", isDirectory: true).path
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
     public static func isPortAvailable(_ port: Int) -> Bool {
@@ -140,5 +151,64 @@ public enum LauncherPreflight {
         }
         let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return (check.terminationStatus == 0, text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    public static func runPythonScript(at path: String, arguments: [String], currentDirectory: String) -> (ok: Bool, output: String) {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory, isDirectory: true)
+        process.standardOutput = output
+        process.standardError = output
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return (false, error.localizedDescription)
+        }
+        let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return (process.terminationStatus == 0, text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+public enum LauncherOnboarding {
+    public static func normalizeRoomInput(provider: String, raw: String) -> String? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        if value.range(of: "^[0-9]+$", options: .regularExpression) != nil {
+            return value
+        }
+        guard let components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host?.lowercased()
+        else { return nil }
+        let acceptedHosts: Set<String> = provider == "bilibili"
+            ? ["live.bilibili.com", "www.live.bilibili.com"]
+            : ["live.douyin.com"]
+        guard acceptedHosts.contains(host) else { return nil }
+        let roomID = components.path.split(separator: "/").first.map(String.init) ?? ""
+        guard roomID.range(of: "^[0-9]+$", options: .regularExpression) != nil else { return nil }
+        return provider == "bilibili" ? roomID : value
+    }
+
+    public static func dashboardURL(port: Int, provider: String, roomInput: String?, demo: Bool) -> URL? {
+        guard let normalized = URLComponents(string: "http://127.0.0.1:\(port)/") else { return nil }
+        var components = normalized
+        var queryItems: [URLQueryItem] = []
+        if let roomInput, let room = normalizeRoomInput(provider: provider, raw: roomInput) {
+            if room.range(of: "^[0-9]+$", options: .regularExpression) != nil {
+                queryItems.append(URLQueryItem(name: "room_id", value: room))
+            } else {
+                queryItems.append(URLQueryItem(name: "room_url", value: room))
+            }
+        }
+        if demo {
+            queryItems.append(URLQueryItem(name: "demo", value: "1"))
+            queryItems.append(URLQueryItem(name: "autostart", value: "1"))
+        }
+        components.queryItems = queryItems.isEmpty ? nil : queryItems
+        return components.url
     }
 }

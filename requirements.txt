@@ -1,0 +1,2 @@
+# Bullet-Screen core and Bilibili use Python's standard library only.
+# Keep this file as the stable core installation entry point.
