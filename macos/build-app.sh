@@ -12,6 +12,7 @@ cp "$SCRIPT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 
 swiftc -O -framework Cocoa \
   -o "$CONTENTS_DIR/MacOS/BulletScreenLauncher" \
+  "$SCRIPT_DIR/LauncherLifecycle.swift" \
   "$SCRIPT_DIR/BulletScreenLauncher.swift"
 
 codesign --force --deep --sign - "$APP_DIR" >/dev/null

@@ -21,6 +21,10 @@ open dist/Bullet-Screen.app
 
 如果 App 被移动到项目目录之外，启动时会弹出目录选择器；选择同时包含 `bilibili/server.py` 和 `douyin/server.py` 的项目根目录即可。
 
+Launcher 会先检查 Python、入口文件、端口和对应依赖，再等待 `/api/health` 与 `/api/bootstrap` 都成功后打开页面。停止时状态会保持为“正在停止”，直到服务进程真正退出；停止请求超时不会伪装成已停止。正常启动使用 `--port 0` 自动选择空闲端口，也可以通过 `BULLET_SCREEN_PORT` 指定端口。为做不触碰真实数据的本机演练，可设置 `BULLET_SCREEN_DB` 指向临时数据库；抖音勾选“本地演示模式”时使用内存数据库，不启动 Playwright，也不使用持久 Profile。
+
+Launcher 也支持 `BULLET_SCREEN_ROOT` 和 `BULLET_SCREEN_PYTHON` 指定项目根目录与 Python。真实抖音模式的 preflight 只检查 Playwright/Chromium 是否可用，实际浏览器仍由服务按现有 `DOUYIN_PROFILE_DIR` 规则管理。
+
 ## B 站看板
 
 ```bash

@@ -1,5 +1,30 @@
 import Cocoa
 
+private final class ActiveRun {
+    let identity: LaunchRunIdentity
+    let provider: String
+    let process: Process
+    let stdout: Pipe
+    let stderr: Pipe
+    var port: Int?
+    var outputBuffer = ""
+    var errorBuffer = ""
+    var readinessTask: URLSessionDataTask?
+    var readinessDeadline: Date?
+    var stopTimeoutWorkItem: DispatchWorkItem?
+    var stopTimedOut = false
+    var pendingStopMessage: String?
+    var pageOpened = false
+
+    init(identity: LaunchRunIdentity, provider: String, process: Process, stdout: Pipe, stderr: Pipe) {
+        self.identity = identity
+        self.provider = provider
+        self.process = process
+        self.stdout = stdout
+        self.stderr = stderr
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private let providerControl = NSSegmentedControl(labels: ["Bilibili", "抖音"], trackingMode: .selectOne, target: nil, action: nil)
@@ -7,13 +32,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let startButton = NSButton(title: "启动看板", target: nil, action: nil)
     private let stopButton = NSButton(title: "停止服务", target: nil, action: nil)
     private let statusLabel = NSTextField(wrappingLabelWithString: "选择平台后启动看板。")
-    private var serverProcess: Process?
-    private var outputPipe: Pipe?
-    private var errorPipe: Pipe?
-    private var outputBuffer = ""
     private let maxOutputBufferCharacters = 64 * 1024
-    private var currentPort: Int?
     private var projectRoot: URL?
+    private let lifecycle = LauncherLifecycleModel()
+    private var activeRun: ActiveRun?
+    private var preflightInProgress = false
+    private var applicationTerminationRequested = false
+    private let readyTimeout: TimeInterval = 10
+    private let readyPollInterval: TimeInterval = 0.25
+    private let stopTimeout: TimeInterval = 5
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
@@ -32,8 +59,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard activeRun != nil else { return .terminateNow }
+        applicationTerminationRequested = true
         stopServer(updateUI: false)
+        return activeRun == nil ? .terminateNow : .terminateLater
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        activeRun?.stdout.fileHandleForReading.readabilityHandler = nil
+        activeRun?.stderr.fileHandleForReading.readabilityHandler = nil
     }
 
     private func buildWindow() {
@@ -112,62 +147,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func startSelectedProvider() {
-        if let process = serverProcess, process.isRunning {
-            stopServer(updateUI: false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                self?.startSelectedProvider()
+        guard !preflightInProgress else { return }
+        guard lifecycle.state == .stopped || lifecycle.state == .failed else {
+            if lifecycle.state == .stopping {
+                setStatus("服务仍在停止，确认进程退出后才能再次启动。", error: true)
+            } else {
+                setStatus("服务正在启动，请稍候。")
             }
             return
         }
+
+        preflightInProgress = true
+        startButton.isEnabled = false
+        stopButton.isEnabled = false
+        setStatus("正在检查运行环境…")
 
         if projectRoot == nil {
             projectRoot = chooseProjectRoot()
         }
         guard let root = projectRoot else {
-            setStatus("尚未选择有效的 Bullet-Screen 项目目录。请再次点击启动后选择。", error: true)
+            failPreflight("尚未选择有效的 Bullet-Screen 项目目录。")
             return
         }
 
         let provider = providerControl.selectedSegment == 1 ? "douyin" : "bilibili"
         let providerRoot = root.appendingPathComponent(provider, isDirectory: true)
-        let serverFile = providerRoot.appendingPathComponent("server.py")
-        guard FileManager.default.fileExists(atPath: serverFile.path) else {
-            setStatus("找不到 \(provider)/server.py。请确认项目文件完整。", error: true)
+        guard LauncherPreflight.hasServer(root: root.path, provider: provider) else {
+            failPreflight("找不到 \(provider)/server.py。请确认项目文件完整。")
             return
         }
 
         guard let python = findPython(in: root) else {
-            setStatus("找不到 Python 3。请安装 Python 3，或设置 BULLET_SCREEN_PYTHON。", error: true)
+            failPreflight("找不到可执行的 Python 3。请安装 Python 3，或设置 BULLET_SCREEN_PYTHON。")
             return
         }
 
+        guard let port = LauncherPreflight.parsePort(ProcessInfo.processInfo.environment["BULLET_SCREEN_PORT"]) else {
+            failPreflight("BULLET_SCREEN_PORT 不是有效端口；请使用 0 或 1-65535。")
+            return
+        }
+        guard LauncherPreflight.isPortAvailable(port) else {
+            failPreflight("端口 \(port) 已被占用，请关闭占用程序或设置其他 BULLET_SCREEN_PORT。")
+            return
+        }
+        if let pythonError = pythonRuntimeError(python) {
+            failPreflight(pythonError)
+            return
+        }
+        if provider == "douyin" && demoControl.state != .on,
+           let error = douyinRuntimeError(python) {
+            failPreflight(error)
+            return
+        }
+
+        let identity = lifecycle.beginStart()!
         let process = Process()
         process.executableURL = python
-        var arguments = ["-u", "server.py", "--port", "0"]
+        var arguments = ["-u", "server.py", "--port", String(port)]
         if provider == "douyin" {
             arguments += ["--mode", demoControl.state == .on ? "demo" : "auto"]
+        }
+        if !(provider == "douyin" && demoControl.state == .on),
+           let configuredDatabase = ProcessInfo.processInfo.environment["BULLET_SCREEN_DB"],
+           !configuredDatabase.isEmpty {
+            let databaseURL = URL(fileURLWithPath: configuredDatabase).standardizedFileURL
+            guard LauncherPreflight.hasDatabaseParent(databaseURL.path) else {
+                _ = lifecycle.fail(identity)
+                failPreflight("BULLET_SCREEN_DB 的父目录不存在：\(databaseURL.deletingLastPathComponent().path)")
+                return
+            }
+            arguments += ["--db", databaseURL.path]
         }
         process.arguments = arguments
         process.currentDirectoryURL = providerRoot
 
         let stdout = Pipe()
         let stderr = Pipe()
-        outputPipe = stdout
-        errorPipe = stderr
         process.standardOutput = stdout
         process.standardError = stderr
+        let run = ActiveRun(identity: identity, provider: provider, process: process, stdout: stdout, stderr: stderr)
+        activeRun = run
         process.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.serverProcess = nil
-                self.outputPipe = nil
-                self.errorPipe = nil
-                self.currentPort = nil
-                self.stopButton.isEnabled = false
-                self.startButton.isEnabled = true
-                if self.statusLabel.stringValue.contains("已启动") {
-                    self.setStatus("本地服务已停止。")
-                }
+                self?.handleTermination(run)
             }
         }
 
@@ -179,7 +241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let text = String(data: data, encoding: .utf8) ?? ""
             DispatchQueue.main.async {
-                self?.consumeServerOutput(text, provider: provider)
+                self?.consumeServerOutput(text, run: run)
             }
         }
         stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -190,18 +252,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let text = String(data: data, encoding: .utf8) ?? ""
             DispatchQueue.main.async {
-                self?.consumeServerError(text)
+                self?.consumeServerError(text, run: run)
             }
         }
 
         do {
             try process.run()
-            serverProcess = process
-            startButton.isEnabled = false
+            preflightInProgress = false
             stopButton.isEnabled = true
-            setStatus("正在启动 \(provider == "douyin" ? "抖音" : "Bilibili") 服务…")
+            setStatus("正在启动 \(provider == "douyin" ? "抖音" : "Bilibili") 服务，等待 ready…")
         } catch {
-            setStatus("启动失败：\(error.localizedDescription)", error: true)
+            handleLaunchFailure(run, message: "进程启动失败：\(error.localizedDescription)")
         }
     }
 
@@ -210,44 +271,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func stopServer(updateUI: Bool) {
-        outputPipe?.fileHandleForReading.readabilityHandler = nil
-        errorPipe?.fileHandleForReading.readabilityHandler = nil
-        if let process = serverProcess, process.isRunning {
-            process.terminate()
+        guard let run = activeRun else {
+            if updateUI { setStatus("本地服务已停止。") }
+            updateControls()
+            return
         }
-        serverProcess = nil
-        outputPipe = nil
-        errorPipe = nil
-        currentPort = nil
-        if updateUI {
-            stopButton.isEnabled = false
-            startButton.isEnabled = true
-            setStatus("本地服务已停止。")
+        guard lifecycle.beginStop(for: run.identity) else {
+            if lifecycle.state == .stopping, updateUI {
+                setStatus("正在停止服务，请等待进程真正退出。", error: true)
+            }
+            return
         }
+        run.readinessTask?.cancel()
+        run.readinessTask = nil
+        run.stdout.fileHandleForReading.readabilityHandler = nil
+        run.stderr.fileHandleForReading.readabilityHandler = nil
+        if run.process.isRunning {
+            run.process.terminate()
+            scheduleStopTimeout(run)
+            setStatus(updateUI ? "正在停止服务，等待进程退出…" : statusLabel.stringValue)
+        } else {
+            handleTermination(run)
+        }
+        updateControls()
     }
 
-    private func consumeServerOutput(_ text: String, provider: String) {
-        outputBuffer += text
-        if outputBuffer.count > maxOutputBufferCharacters {
-            outputBuffer = String(outputBuffer.suffix(maxOutputBufferCharacters))
+    private func consumeServerOutput(_ text: String, run: ActiveRun) {
+        guard activeRun?.identity == run.identity, lifecycle.accepts(run.identity) else { return }
+        run.outputBuffer += text
+        if run.outputBuffer.count > maxOutputBufferCharacters {
+            run.outputBuffer = String(run.outputBuffer.suffix(maxOutputBufferCharacters))
         }
-        while let newline = outputBuffer.firstIndex(of: "\n") {
-            let line = String(outputBuffer[..<newline]).trimmingCharacters(in: .whitespacesAndNewlines)
-            outputBuffer = String(outputBuffer[outputBuffer.index(after: newline)...])
+        while let newline = run.outputBuffer.firstIndex(of: "\n") {
+            let line = String(run.outputBuffer[..<newline]).trimmingCharacters(in: .whitespacesAndNewlines)
+            run.outputBuffer = String(run.outputBuffer[run.outputBuffer.index(after: newline)...])
             guard let port = extractPort(from: line) else { continue }
-            currentPort = port
-            setStatus("已启动 \(provider == "douyin" ? "抖音" : "Bilibili") 看板 · 端口 \(port)")
-            if let url = URL(string: "http://127.0.0.1:\(port)/") {
-                NSWorkspace.shared.open(url)
+            if run.port == nil {
+                run.port = port
+                beginReadinessChecks(run)
             }
         }
     }
 
-    private func consumeServerError(_ text: String) {
-        if currentPort != nil { return }
+    private func consumeServerError(_ text: String, run: ActiveRun) {
+        guard activeRun?.identity == run.identity, lifecycle.accepts(run.identity) else { return }
+        run.errorBuffer += text
+        if run.errorBuffer.count > 4 * 1024 {
+            run.errorBuffer = String(run.errorBuffer.suffix(4 * 1024))
+        }
+        if run.port != nil { return }
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { return }
-        setStatus("服务启动提示：\(message.suffix(220))", error: true)
+        setStatus("服务启动提示：\(String(message.suffix(220)))", error: true)
     }
 
     private func extractPort(from line: String) -> Int? {
@@ -335,11 +410,187 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "/usr/local/bin/python3",
             "/usr/bin/python3"
         ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }.map(URL.init(fileURLWithPath:))
+        return candidates.first { LauncherPreflight.isExecutable($0) }.map(URL.init(fileURLWithPath:))
+    }
+
+    private func failPreflight(_ message: String) {
+        preflightInProgress = false
+        activeRun = nil
+        updateControls()
+        setStatus("无法启动：\(message)", error: true)
+    }
+
+    private func updateControls() {
+        startButton.isEnabled = !preflightInProgress && (lifecycle.state == .stopped || lifecycle.state == .failed)
+        stopButton.isEnabled = lifecycle.state == .starting || lifecycle.state == .waitingForReady || lifecycle.state == .running
+    }
+
+    private func runPythonCheck(_ python: URL, script: String) -> (Bool, String) {
+        let result = LauncherPreflight.runPythonCheck(at: python.path, script: script)
+        return (result.ok, result.output)
+    }
+
+    private func pythonRuntimeError(_ python: URL) -> String? {
+        let result = runPythonCheck(python, script: "import sys; print(sys.version.split()[0])")
+        return result.0 ? nil : "Python 无法运行：\(result.1)"
+    }
+
+    private func douyinRuntimeError(_ python: URL) -> String? {
+        let script = "import os; from playwright.sync_api import sync_playwright; p=sync_playwright().start(); path=p.chromium.executable_path; p.stop(); assert os.path.isfile(path), path; print(path)"
+        let result = runPythonCheck(python, script: script)
+        return result.0 ? nil : "抖音真实模式缺少可用的 Playwright/Chromium：\(result.1)"
+    }
+
+    private func beginReadinessChecks(_ run: ActiveRun) {
+        guard activeRun?.identity == run.identity, lifecycle.accepts(run.identity), let port = run.port else { return }
+        _ = lifecycle.markWaitingForReady(run.identity)
+        run.readinessDeadline = Date().addingTimeInterval(readyTimeout)
+        setStatus("服务已监听端口 \(port)，正在等待 health/bootstrap ready…")
+        pollReadiness(run)
+    }
+
+    private func pollReadiness(_ run: ActiveRun) {
+        guard activeRun?.identity == run.identity, lifecycle.accepts(run.identity), let port = run.port else { return }
+        guard let deadline = run.readinessDeadline else { return }
+        guard Date() < deadline else {
+            handleLaunchFailure(run, message: "服务没有在规定时间内 ready。")
+            return
+        }
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/api/health")!)
+        request.timeoutInterval = 1
+        run.readinessTask = URLSession.shared.dataTask(with: request) { [weak self, weak run] data, response, _ in
+            guard let self, let run else { return }
+            let healthy = (response as? HTTPURLResponse)?.statusCode == 200
+                && ((try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any])?["ok"] as? Bool == true
+            DispatchQueue.main.async {
+                guard self.activeRun?.identity == run.identity, self.lifecycle.accepts(run.identity) else { return }
+                if healthy {
+                    self.checkBootstrap(run)
+                } else {
+                    self.scheduleReadinessPoll(run)
+                }
+            }
+        }
+        run.readinessTask?.resume()
+    }
+
+    private func checkBootstrap(_ run: ActiveRun) {
+        guard activeRun?.identity == run.identity, lifecycle.accepts(run.identity), let port = run.port else { return }
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/api/bootstrap")!)
+        request.timeoutInterval = 1
+        run.readinessTask = URLSession.shared.dataTask(with: request) { [weak self, weak run] data, response, _ in
+            guard let self, let run else { return }
+            let payload = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            let ready = (response as? HTTPURLResponse)?.statusCode == 200
+                && (payload?["token"] as? String)?.isEmpty == false
+            DispatchQueue.main.async {
+                guard self.activeRun?.identity == run.identity, self.lifecycle.accepts(run.identity) else { return }
+                if ready {
+                    run.readinessTask = nil
+                    _ = self.lifecycle.markReady(run.identity)
+                    self.updateControls()
+                    self.setStatus("\(run.provider == "douyin" ? "抖音" : "Bilibili") 服务已 ready · 端口 \(port)")
+                    if !run.pageOpened {
+                        run.pageOpened = true
+                        NSWorkspace.shared.open(URL(string: "http://127.0.0.1:\(port)/")!)
+                    }
+                } else {
+                    self.scheduleReadinessPoll(run)
+                }
+            }
+        }
+        run.readinessTask?.resume()
+    }
+
+    private func scheduleReadinessPoll(_ run: ActiveRun) {
+        run.readinessTask = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + readyPollInterval) { [weak self, weak run] in
+            guard let self, let run else { return }
+            self.pollReadiness(run)
+        }
+    }
+
+    private func scheduleStopTimeout(_ run: ActiveRun) {
+        let item = DispatchWorkItem { [weak self, weak run] in
+            guard let self, let run,
+                  self.activeRun?.identity == run.identity,
+                  self.lifecycle.state == .stopping,
+                  run.process.isRunning else { return }
+            _ = self.lifecycle.markStopTimedOut(for: run.identity)
+            run.stopTimedOut = true
+            run.pendingStopMessage = "停止请求超时；服务进程仍在运行，尚未确认 stopped。"
+            self.setStatus(run.pendingStopMessage!, error: true)
+            self.updateControls()
+        }
+        run.stopTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + stopTimeout, execute: item)
+    }
+
+    private func handleLaunchFailure(_ run: ActiveRun, message: String) {
+        guard activeRun?.identity == run.identity else { return }
+        preflightInProgress = false
+        run.pendingStopMessage = "启动失败：\(message)"
+        if lifecycle.beginStop(for: run.identity) {
+            run.stdout.fileHandleForReading.readabilityHandler = nil
+            run.stderr.fileHandleForReading.readabilityHandler = nil
+            if run.process.isRunning {
+                run.process.terminate()
+                scheduleStopTimeout(run)
+                setStatus("\(message) 正在停止服务…", error: true)
+            } else {
+                handleTermination(run)
+            }
+            updateControls()
+        } else {
+            _ = lifecycle.fail(run.identity)
+            cleanupRun(run)
+            setStatus(run.pendingStopMessage!, error: true)
+            updateControls()
+        }
+    }
+
+    private func handleTermination(_ run: ActiveRun) {
+        guard activeRun?.identity == run.identity else { return }
+        run.stopTimeoutWorkItem?.cancel()
+        run.readinessTask?.cancel()
+        run.readinessTask = nil
+        let wasStopping = lifecycle.state == .stopping
+        let exitCode = run.process.terminationStatus
+        if wasStopping {
+            _ = lifecycle.finishStop(for: run.identity)
+            let message = run.pendingStopMessage ?? (run.stopTimedOut ? "本地服务已退出（此前停止请求曾超时）。" : "本地服务已停止。")
+            cleanupRun(run)
+            setStatus(message)
+        } else {
+            _ = lifecycle.fail(run.identity)
+            let detail = run.errorBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            let phase = run.port == nil ? "服务在 ready 前退出" : "服务进程已退出"
+            let suffix = detail.isEmpty ? "" : "：\(String(detail.suffix(180)))"
+            cleanupRun(run)
+            setStatus("\(phase)（退出码 \(exitCode)）\(suffix)", error: true)
+        }
+        preflightInProgress = false
+        updateControls()
+        if applicationTerminationRequested {
+            applicationTerminationRequested = false
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+    }
+
+    private func cleanupRun(_ run: ActiveRun) {
+        guard activeRun?.identity == run.identity else { return }
+        run.stdout.fileHandleForReading.readabilityHandler = nil
+        run.stderr.fileHandleForReading.readabilityHandler = nil
+        activeRun = nil
     }
 }
 
-let application = NSApplication.shared
-let delegate = AppDelegate()
-application.delegate = delegate
-application.run()
+@main
+struct BulletScreenLauncherMain {
+    static func main() {
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        application.run()
+    }
+}
