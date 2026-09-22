@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Govern the two local SQLite stores without losing historical live data.
 
-The migration is explicit: without ``--apply`` it only reports what would
-change. Apply always retains source tables; any later cleanup is a separate
-approved operation after independent verification.
+The legacy v2 -> v3 and explicit v3 -> v4 migrations are separate.  Apply
+requires an explicit target version, retains a source backup, and switches
+only verified isolated candidates; any later cleanup is a separate approved
+operation after independent verification.
 """
 
 from __future__ import annotations
@@ -23,7 +24,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BILIBILI_DB = ROOT / "bilibili" / "data" / "danmaku.sqlite3"
 DEFAULT_DOUYIN_DB = ROOT / "douyin" / "data" / "danmaku.sqlite3"
 LEGACY_LIVE_TABLES = ("live_metric_snapshots", "live_events", "live_sessions")
+# Keep the original v2 -> v3 rehearsal contract intact; v4 is an explicit,
+# separate migration that only adds the signal domain tables.
 SCHEMA_VERSION = 3
+V4_SCHEMA_VERSION = 4
+from schema_v4 import V4_TABLES, create_signal_schema, verify_signal_schema
 
 
 class MigrationConflict(RuntimeError):
@@ -32,6 +37,10 @@ class MigrationConflict(RuntimeError):
 
 class RehearsalFailure(RuntimeError):
     """Synthetic failure injected into an isolated migration rehearsal."""
+
+
+class SchemaVersionError(RuntimeError):
+    """A migration source or target has an unsupported schema version."""
 
 
 def table_exists(connection: sqlite3.Connection, table: str) -> bool:
@@ -785,17 +794,212 @@ def apply_migration(
             lock.close()
 
 
+def _database_version(connection: sqlite3.Connection) -> int:
+    return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _verify_v3_migration_source(connection: sqlite3.Connection) -> None:
+    version = _database_version(connection)
+    if version != SCHEMA_VERSION:
+        raise SchemaVersionError(f"v3 migration requires source schema {SCHEMA_VERSION}, got {version}")
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    if tables & V4_TABLES:
+        raise SchemaVersionError("v3 source already contains v4 signal tables")
+    verify_database(connection)
+
+
+def _verify_v4_migration_target(connection: sqlite3.Connection, session_table: str, event_table: str) -> None:
+    if _database_version(connection) != V4_SCHEMA_VERSION:
+        raise SchemaVersionError("v4 target does not declare schema version 4")
+    verify_database(connection)
+    try:
+        verify_signal_schema(connection, session_table, event_table)
+    except Exception as error:
+        raise SchemaVersionError(str(error)) from error
+
+
+def migrate_v3_to_v4_connection(connection: sqlite3.Connection, session_table: str, event_table: str) -> str:
+    """Upgrade one isolated v3 connection by adding only empty v4 tables."""
+
+    connection.execute("PRAGMA foreign_keys=ON")
+    version = _database_version(connection)
+    if version == V4_SCHEMA_VERSION:
+        _verify_v4_migration_target(connection, session_table, event_table)
+        return "already-v4"
+    if version > V4_SCHEMA_VERSION:
+        raise SchemaVersionError(f"database schema {version} is newer than supported {V4_SCHEMA_VERSION}")
+    _verify_v3_migration_source(connection)
+    before = database_signature(connection)
+    try:
+        create_signal_schema(connection, session_table, event_table, user_version=V4_SCHEMA_VERSION)
+        _verify_v4_migration_target(connection, session_table, event_table)
+        after = database_signature(connection)
+        if any(after.get(table) != signature for table, signature in before.items()):
+            raise RuntimeError("v3 data changed during v3 to v4 migration")
+    except Exception:
+        connection.rollback()
+        raise
+    return "migrated"
+
+
+def apply_v4_migration(
+    bilibili_path: Path,
+    douyin_path: Path,
+    workspace: Path,
+    fail_stage: str | None = None,
+) -> Dict[str, object]:
+    """Migrate v3 fixtures through isolated candidates and a recoverable switch."""
+
+    bilibili_path = Path(bilibili_path)
+    douyin_path = Path(douyin_path)
+    workspace = Path(workspace)
+    if not bilibili_path.exists() or not douyin_path.exists():
+        missing = bilibili_path if not bilibili_path.exists() else douyin_path
+        raise FileNotFoundError(f"database does not exist: {missing}")
+    if workspace.exists() and any(workspace.iterdir()):
+        if (workspace / "migration-state.json").exists() and recover_migration(workspace):
+            raise RehearsalFailure("recovered-interrupted-switch")
+        raise FileExistsError(f"migration workspace is not empty: {workspace}")
+
+    lock_handles = []
+    source_connections = []
+    staged_connections = []
+    try:
+        for path in (bilibili_path, douyin_path):
+            lock_handles.append(_acquire_database_lock(path))
+        versions = []
+        for path, session_table, event_table in (
+            (bilibili_path, "sessions", "events"),
+            (douyin_path, "live_sessions", "live_events"),
+        ):
+            connection = connect(path)
+            try:
+                version = _database_version(connection)
+                versions.append(version)
+                if version == V4_SCHEMA_VERSION:
+                    _verify_v4_migration_target(connection, session_table, event_table)
+            finally:
+                connection.close()
+        if versions == [V4_SCHEMA_VERSION, V4_SCHEMA_VERSION]:
+            return {"status": "already-v4"}
+        if any(version == V4_SCHEMA_VERSION for version in versions):
+            raise SchemaVersionError("cannot migrate a mixed v3/v4 database pair")
+
+        workspace.mkdir(parents=True, exist_ok=True)
+        source_dir = workspace / "source"
+        staging_dir = workspace / "staging"
+        original_dir = workspace / "original"
+        source_dir.mkdir()
+        staging_dir.mkdir()
+        original_dir.mkdir()
+        source_paths = [source_dir / "bilibili.sqlite3", source_dir / "douyin.sqlite3"]
+        for source, destination in zip((bilibili_path, douyin_path), source_paths):
+            _copy_bundle(source, destination)
+        _fail_if_requested(fail_stage, "copy")
+        for source_path in source_paths:
+            connection = connect(source_path)
+            source_connections.append(connection)
+            _verify_v3_migration_source(connection)
+        _fail_if_requested(fail_stage, "verify-before")
+
+        staging_paths = [staging_dir / "bilibili.sqlite3", staging_dir / "douyin.sqlite3"]
+        for connection, destination in zip(source_connections, staging_paths):
+            backup(connection, destination)
+        for connection in reversed(source_connections):
+            connection.close()
+        source_connections.clear()
+
+        for staging_path in staging_paths:
+            staged_connections.append(connect(staging_path))
+        migrate_v3_to_v4_connection(staged_connections[0], "sessions", "events")
+        migrate_v3_to_v4_connection(staged_connections[1], "live_sessions", "live_events")
+        _fail_if_requested(fail_stage, "migration")
+        for connection, session_table, event_table in zip(
+            staged_connections,
+            ("sessions", "live_sessions"),
+            ("events", "live_events"),
+        ):
+            _verify_v4_migration_target(connection, session_table, event_table)
+        _fail_if_requested(fail_stage, "verify-after")
+
+        original_paths = [original_dir / "bilibili.sqlite3", original_dir / "douyin.sqlite3"]
+        for source, original in zip((bilibili_path, douyin_path), original_paths):
+            _copy_bundle(source, original)
+        state_path = workspace / "migration-state.json"
+        state = {
+            "status": "prepared",
+            "schema_version": V4_SCHEMA_VERSION,
+            "databases": [
+                {"name": "bilibili", "active": str(bilibili_path), "candidate": str(staging_paths[0]), "original": str(original_paths[0])},
+                {"name": "douyin", "active": str(douyin_path), "candidate": str(staging_paths[1]), "original": str(original_paths[1])},
+            ],
+        }
+        _write_state(state_path, state)
+        _fail_if_requested(fail_stage, "switch-before")
+        state["status"] = "switching"
+        state["switched"] = []
+        _write_state(state_path, state)
+        try:
+            for item in state["databases"]:
+                active = Path(item["active"])
+                candidate = Path(item["candidate"])
+                try:
+                    _remove_bundle(active)
+                    os.replace(candidate, active)
+                except Exception:
+                    _restore_bundle(Path(item["original"]), active)
+                    raise
+                state["switched"].append(item["name"])
+                _write_state(state_path, state)
+                if fail_stage == "switch":
+                    raise RehearsalFailure("switch")
+        except Exception:
+            for item in state["databases"]:
+                if item["name"] in state["switched"]:
+                    _restore_bundle(Path(item["original"]), Path(item["active"]))
+            state["status"] = "rolled-back"
+            _write_state(state_path, state)
+            raise
+        state["status"] = "applied"
+        _write_state(state_path, state)
+        for active in (bilibili_path, douyin_path):
+            connection = connect(active)
+            try:
+                session_table, event_table = ("sessions", "events") if active == bilibili_path else ("live_sessions", "live_events")
+                _verify_v4_migration_target(connection, session_table, event_table)
+            finally:
+                connection.close()
+        return {"status": "applied", "backup": {"bilibili": str(original_paths[0]), "douyin": str(original_paths[1])}, "state": str(state_path)}
+    finally:
+        for connection in reversed(staged_connections):
+            connection.close()
+        for connection in reversed(source_connections):
+            connection.close()
+        for lock in reversed(lock_handles):
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Govern Bullet-Screen SQLite databases")
     parser.add_argument("--bilibili", type=Path, default=DEFAULT_BILIBILI_DB)
     parser.add_argument("--douyin", type=Path, default=DEFAULT_DOUYIN_DB)
     parser.add_argument("--backup-dir", type=Path, default=None)
     parser.add_argument("--apply", action="store_true", help="apply the migration; without it only report changes")
+    parser.add_argument("--target-version", type=int, choices=(3, 4), help="explicit migration target; required with --apply")
     args = parser.parse_args()
 
     if args.apply:
+        if args.target_version is None:
+            parser.error("--apply requires --target-version 3 or 4")
         workspace = args.backup_dir or args.bilibili.parent / ".bullet-screen-db-migration"
-        result = apply_migration(args.bilibili, args.douyin, workspace)
+        if args.target_version == V4_SCHEMA_VERSION:
+            result = apply_v4_migration(args.bilibili, args.douyin, workspace)
+        else:
+            result = apply_migration(args.bilibili, args.douyin, workspace)
+        if result["status"] == "already-v4":
+            print("database migration: ALREADY V4 (no changes)")
+            return
         print(f"migration state: {result['state']}")
         print(f"backup: {result['backup']}")
         print("database migration: APPLIED")

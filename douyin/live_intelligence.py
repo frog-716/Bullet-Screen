@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -12,6 +13,12 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from schema_v4 import SCHEMA_VERSION as V4_SCHEMA_VERSION, V4_TABLES, create_signal_schema, verify_signal_schema
 
 
 EVENT_TYPES = {
@@ -52,7 +59,7 @@ STOP_WORDS = {
 }
 
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = V4_SCHEMA_VERSION
 CORE_SCHEMA_TABLES = {"live_sessions", "live_events", "live_metric_snapshots", "capture_gaps"}
 SCHEMA_COLUMNS = {
     "live_sessions": {
@@ -114,7 +121,7 @@ def verify_schema_signature(connection: sqlite3.Connection) -> None:
         )
     }
     missing_tables = CORE_SCHEMA_TABLES - tables
-    unexpected_tables = tables - CORE_SCHEMA_TABLES
+    unexpected_tables = tables - CORE_SCHEMA_TABLES - V4_TABLES
     if missing_tables or unexpected_tables:
         raise SchemaVersionError(
             f"Douyin schema signature mismatch: missing={sorted(missing_tables)}, unexpected={sorted(unexpected_tables)}"
@@ -153,6 +160,10 @@ def verify_schema_signature(connection: sqlite3.Connection) -> None:
         actual = {(row[2], row[3], row[4]) for row in connection.execute(f"PRAGMA foreign_key_list({table})")}
         if actual != expected:
             raise SchemaVersionError(f"Douyin schema signature mismatch in foreign keys for {table}")
+    try:
+        verify_signal_schema(connection, "live_sessions", "live_events")
+    except Exception as error:
+        raise SchemaVersionError(str(error)) from error
 
 
 def utc_now() -> str:
@@ -418,7 +429,7 @@ class LiveEventStore:
             CREATE INDEX IF NOT EXISTS idx_capture_gaps_session_time ON capture_gaps(session_id, gap_start, gap_end);
             """
         )
-        self.connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+        create_signal_schema(self.connection, "live_sessions", "live_events", user_version=self.SCHEMA_VERSION)
         self.connection.commit()
 
     def _reconcile_interrupted_sessions(self) -> None:

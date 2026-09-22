@@ -51,11 +51,13 @@ Douyin 真实浏览器模式默认使用 `douyin/data/browser-profile/` 持久 P
 
 ## 数据库治理
 
-当前服务支持的数据库 schema version 是 `3`。本机现有数据库可能仍处于 v2。打开已有数据库时会同时检查版本和 schema signature（表、列属性、索引、唯一约束与 foreign key）；版本过旧、未知、更新或结构损坏都会拒绝继续写入。空数据库和 `--mode demo` 仍可创建内存/新数据库。已有 v2 数据库不能被 v3 服务直接写入，也不会被服务偷偷升级；迁移必须显式执行。
+当前服务支持的数据库 schema version 是 `4`。本机现有数据库可能仍处于 v2；v3 也不能被 v4 服务直接写入。打开已有数据库时会同时检查版本和 schema signature（表、列属性、索引、唯一约束、foreign key 与 check constraint）；版本过旧、未知、更新或结构损坏都会拒绝继续写入。空数据库和 `--mode demo` 仍可创建内存/新数据库。旧数据库不会被服务偷偷升级；迁移必须显式执行。
 
-迁移脚本位于 [`scripts/govern_databases.py`](scripts/govern_databases.py)，正式流程是锁定、复制 SQLite/WAL/SHM、只在隔离副本上验证和迁移、验证 candidate、持久化状态后切换，并保留原数据库用于恢复。本 checkpoint 没有对真实 v2 数据库执行 migration；任何真实操作前都必须先使用隔离副本完成演练。
+迁移脚本位于 [`scripts/govern_databases.py`](scripts/govern_databases.py)，正式流程是锁定、复制 SQLite/WAL/SHM、只在隔离副本上验证和迁移、验证 candidate、持久化状态后切换，并保留原数据库用于恢复。v3 → v4 只创建空的 `signals`、`signal_evidence`、`signal_feedback` 表，不会根据旧事件脑补历史 signal；重复执行已是 v4 的目标会保持不变。本 checkpoint 没有对真实 v2/v3 数据库执行 migration；任何真实操作前都必须先使用隔离副本完成演练。
 
 coverage API 区分四种状态：`reliable_with_data`（窗口完整且有事件）、`reliable_no_events`（有可靠采集证据但窗口内无事件）、`gap`（窗口与采集缺口重叠）和 `unknown`（没有足够证据判断完整性）。`unknown/null` 不等于数字 `0`；礼物数量、平台原始金额、币种和估算收入分别保留，不能互相替代。
+
+v4 的 `signals` 只保存规则推断本身，`signal_evidence` 通过对应数据库的事件行主键建立外键，`signal_feedback` 保存多条人工评价；`signal_id` 由 provider、room、session、run、规则版本、信号类型和时间窗口稳定生成。v3 → v4 不会自动从历史事件生成 signal。
 
 当前数据库只保留看板实际读取的字段：B 站事件移除了未使用的 `received_at`、`raw_json`；抖音事件移除了未使用的 `received_at`。早期误写入 B 站库的 `live_*` 抖音表已迁移到 `douyin/data/danmaku.sqlite3`，再从 B 站库删除。
 

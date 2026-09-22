@@ -21,6 +21,7 @@ import socket
 import sqlite3
 import ssl
 import struct
+import sys
 import threading
 import time
 import urllib.error
@@ -35,6 +36,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = ROOT.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from schema_v4 import SCHEMA_VERSION as V4_SCHEMA_VERSION, V4_TABLES, create_signal_schema, verify_signal_schema
+
 DEFAULT_DB = ROOT / "data" / "danmaku.sqlite3"
 STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/snapshot_client.js": "snapshot_client.js", "/styles.css": "styles.css"}
 PUBLIC_API_PATHS = {"/api/health", "/api/bootstrap"}
@@ -49,7 +55,7 @@ MAX_PACKET_BODY_BYTES = 4 * 1024 * 1024
 MAX_PACKET_TOTAL_BYTES = 8 * 1024 * 1024
 MAX_PACKET_COUNT = 512
 MAX_PACKET_DEPTH = 4
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = V4_SCHEMA_VERSION
 CORE_SCHEMA_TABLES = {"sessions", "events", "metric_snapshots", "capture_gaps"}
 LEGACY_SCHEMA_TABLES = {"live_sessions", "live_events", "live_metric_snapshots"}
 SCHEMA_COLUMNS = {
@@ -184,7 +190,7 @@ def verify_schema_signature(connection: sqlite3.Connection) -> None:
         )
     }
     missing_tables = CORE_SCHEMA_TABLES - tables
-    unexpected_tables = tables - CORE_SCHEMA_TABLES - LEGACY_SCHEMA_TABLES
+    unexpected_tables = tables - CORE_SCHEMA_TABLES - LEGACY_SCHEMA_TABLES - V4_TABLES
     if missing_tables or unexpected_tables:
         raise SchemaVersionError(
             f"Bilibili schema signature mismatch: missing={sorted(missing_tables)}, unexpected={sorted(unexpected_tables)}"
@@ -224,6 +230,10 @@ def verify_schema_signature(connection: sqlite3.Connection) -> None:
         }[table]
         if foreign_keys != expected_foreign_key:
             raise SchemaVersionError(f"Bilibili schema signature mismatch in foreign keys for {table}")
+    try:
+        verify_signal_schema(connection, "sessions", "events")
+    except Exception as error:
+        raise SchemaVersionError(str(error)) from error
 
 
 @dataclass(frozen=True)
@@ -767,7 +777,7 @@ class EventStore:
         CREATE INDEX IF NOT EXISTS idx_metrics_session_time ON metric_snapshots(session_id, recorded_at);
         CREATE INDEX IF NOT EXISTS idx_capture_gaps_session_time ON capture_gaps(session_id, gap_start, gap_end);
         """)
-        self.connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+        create_signal_schema(self.connection, "sessions", "events", user_version=self.SCHEMA_VERSION)
         self.connection.commit()
 
     def _reconcile_interrupted_sessions(self) -> None:

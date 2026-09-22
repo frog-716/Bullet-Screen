@@ -47,6 +47,8 @@ python3 server.py
 - `sessions`：直播场次
 - `events`：原始业务事件
 - `metric_snapshots`：B 站热度值、点赞事件和弹幕速率快照
+- `capture_gaps`：采集缺口
+- `signals`、`signal_evidence`、`signal_feedback`：v4 信号存储基础；本阶段只建立空表，不自动生成历史信号
 
 SQLite 文件被 `.gitignore` 排除，凭证不会进入仓库。
 
