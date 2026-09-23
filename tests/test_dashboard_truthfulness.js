@@ -113,6 +113,12 @@ for (const provider of ["bilibili", "douyin"]) {
   const lowLevelApiError = present({ status: "error", errorCode: "api_error", error: "Load failed" });
   assert(!lowLevelApiError.guidance.includes("Load failed"));
   assert.strictEqual(lowLevelApiError.diagnostics.error, "Load failed");
+  const failedAuthenticationSnapshot = snapshot.applySnapshotState({}, {
+    status: "error", room_id: "123456", worker_alive: false,
+    last_valid_at: null, metrics: { last_valid_at: null }, events: { items: [] },
+  });
+  const failedAuthenticationView = present({ ...failedAuthenticationSnapshot, serverAvailable: true });
+  assert.strictEqual(failedAuthenticationView.lastReliableLabel, "");
   assert.match(present({ snapshotFailed: true, error: "本地服务没有响应", lastValidAt: "2026-09-23T12:34:50Z" }).lastReliableLabel, /^最后一次可靠数据：/);
 
   const demo = present({ mode: "demo", coverage: { coverage_state: "gap" } });

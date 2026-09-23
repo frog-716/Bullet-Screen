@@ -1413,15 +1413,18 @@ class Collector:
         if context is not None and not self._owns_active_run(context):
             return
         packets = list(PacketCodec.decode(payload))
-        if context is not None:
-            if not self._mark_valid(context):
-                return
-        else:
+        activity_marked = False
+
+        def mark_packet_activity() -> bool:
+            if context is not None:
+                return self._mark_valid(context)
             with self.lock:
                 if self.status_name not in {"connecting", "authenticating", "connected", "stale"} or self.session_id is None:
-                    return
+                    return False
                 self.last_valid_at = utc_now()
                 self._last_valid_monotonic = time.monotonic()
+                return True
+
         for operation, _protover, body in packets:
             if operation == 8:
                 try:
@@ -1430,6 +1433,9 @@ class Collector:
                     raise ProtocolError("Bilibili WebSocket authentication response is not valid JSON") from error
                 if not isinstance(auth_result, dict) or isinstance(auth_result.get("code"), bool) or "code" not in auth_result or safe_int(auth_result.get("code"), -1) != 0:
                     raise ProtocolError("Bilibili WebSocket authentication response did not explicitly confirm code=0")
+                if not mark_packet_activity():
+                    return
+                activity_marked = True
                 with self.lock:
                     if (context is None or self._context is context) and self.status_name == "authenticating":
                         self.status_name = "connected"
@@ -1437,6 +1443,10 @@ class Collector:
                             context.capture_verified.set()
                             self.store.close_open_gaps(self.session_id, context.run_id)
                 continue
+            if not activity_marked:
+                if not mark_packet_activity():
+                    return
+                activity_marked = True
             if operation == 3 and len(body) >= 4:
                 with self.lock:
                     if (context is None or self._context is context) and not self.online_event_seen:
