@@ -81,9 +81,24 @@ for (const provider of ["bilibili", "douyin"]) {
 
   assert.strictEqual(present({ status: "connecting" }).headline, "正在连接");
   assert.strictEqual(present({ status: "stopping" }).headline, "正在停止");
-  assert.strictEqual(present({ status: "stopped" }).headline, "已停止");
-  assert.strictEqual(present({ status: "offline", serverAvailable: false }).headline, "服务离线");
-  assert.strictEqual(present({ serverAvailable: false, snapshotFailed: true, errorCode: "api_error" }).headline, "服务离线");
+  const stoppedSnapshot = snapshot.applySnapshotState({ roomId: "123456", serverAvailable: true }, {
+    status: "stopped", worker_alive: false, room_id: "123456", events: { items: [] },
+    coverage: { coverage_state: "reliable_no_events" },
+  });
+  const stopped = present({ ...stoppedSnapshot, serverAvailable: true });
+  assert.strictEqual(stopped.headline, "采集已停止");
+  assert(!stopped.guidance.includes("本地服务没有响应"));
+  assert(stopped.actions.includes("connect"));
+  assert.strictEqual(snapshot.statusText("stopped"), "采集已停止");
+  assert.strictEqual(snapshot.statusText("service_offline"), "本地服务没有响应");
+  assert.strictEqual(present({ status: "offline", serverAvailable: true, workerAlive: false }).headline, "采集已停止");
+  const serviceOffline = present({ status: "stopped", serverAvailable: false, snapshotFailed: true, errorCode: "api_error" });
+  assert.strictEqual(serviceOffline.headline, "本地服务没有响应");
+  assert(serviceOffline.guidance.includes("检查安装环境"));
+  assert(serviceOffline.actions.includes("retry"));
+  assert.strictEqual(present({ status: "connected", serverAvailable: true }).headline, "采集正常");
+  assert.strictEqual(present({ status: "stopping", serverAvailable: true }).headline, "正在停止");
+  assert.strictEqual(present({ status: "stale", serverAvailable: true }).headline, "采集可能中断");
   assert.strictEqual(present({ status: "error", error: "采集异常" }).headline, "采集出错");
   assert.strictEqual(present({ errorCode: "connect_error", error: "房间未开播" }).headline, "启动失败");
   assert.strictEqual(present({ status: "idle", workerAlive: true }).headline, "尚未开始采集");
@@ -137,6 +152,7 @@ for (const provider of ["bilibili", "douyin"]) {
     assert(app.includes("演示内容只在运行期间保留，不写入本机文件"));
   }
   assert(app.includes("dashboardPresentation"));
+  assert(app.includes('"service_offline"'));
   assert(app.includes("data-truth-action"));
   assert(app.includes('diagnosticError").textContent=model.diagnostics.error'));
   assert.match(app, /function showToast\(message\).*userFacingError/s, `${provider} toast must hide raw browser/network errors`);

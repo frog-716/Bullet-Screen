@@ -71,9 +71,10 @@
     connected: "采集正常",
     stopping: "正在停止",
     stale: "采集可能中断",
-    stopped: "已停止",
+    stopped: "采集已停止",
     error: "采集出错",
-    offline: "服务离线",
+    offline: "采集已停止",
+    service_offline: "本地服务没有响应",
     idle: "尚未开始采集",
   }[status] || "状态未知");
 
@@ -95,18 +96,14 @@
 
   function dashboardPresentation(input = {}) {
     const coverage = typeof input.coverage === "string" ? input.coverage : input.coverage?.coverage_state;
-    const status = input.serverAvailable === false ? "offline" : input.status || "idle";
+    const status = input.serverAvailable === false ? "service_offline" : input.status || "idle";
     let headline = "状态未知", guidance = "请重新检查本地服务状态。", actions = ["retry"];
 
     if (input.errorCode === "snapshot_unstable") {
       headline = "状态正在变化，请重新检查";
       guidance = "直播间或采集状态刚刚切换；重新读取后就能看到最新状态。";
-    } else if ((input.errorCode === "api_error" || input.snapshotFailed) && input.serverAvailable === false) {
-      headline = "服务离线";
-      guidance = "本地服务没有响应。请启动 Bullet-Screen，或运行安装环境检查。";
-      actions = ["retry"];
     } else if (input.errorCode === "api_error" || input.snapshotFailed) {
-      headline = "本地服务暂时无法响应";
+      headline = "本地服务没有响应";
       guidance = "本地服务没有响应。请点击“重新检查”；如果仍不行，请回到启动器重启服务或检查安装环境。";
     } else if (input.errorCode === "room_invalid") {
       headline = "直播间信息有误";
@@ -124,9 +121,9 @@
       headline = "演示数据正在运行";
       guidance = "页面中的互动和指标是演示内容，不是真实直播数据。";
       actions = ["retry"];
-    } else if (status === "offline") {
-      headline = "服务离线";
-      guidance = "本地服务没有响应。请启动 Bullet-Screen，或运行安装环境检查。";
+    } else if (status === "service_offline") {
+      headline = "本地服务没有响应";
+      guidance = "请回到启动器重新启动服务，或运行安装环境检查。";
       actions = ["retry"];
     } else if (status === "connecting" || status === "authenticating") {
       headline = "正在连接";
@@ -136,9 +133,9 @@
       headline = "正在停止";
       guidance = "正在等待采集任务退出，完成前暂时不能重新启动。";
       actions = [];
-    } else if (status === "stopped" || status === "idle") {
-      headline = status === "stopped" ? "已停止" : "尚未开始采集";
-      guidance = "选择直播间并点击连接即可开始。";
+    } else if (status === "stopped" || status === "offline" || status === "idle") {
+      headline = status === "idle" ? "尚未开始采集" : "采集已停止";
+      guidance = status === "idle" ? "选择直播间并点击连接即可开始。" : "采集任务已停止，本地服务仍在运行。可以重新连接或修改直播间。";
       actions = ["connect", "settings"];
     } else if (status === "error") {
       headline = "采集出错";
