@@ -26,7 +26,9 @@ AS_OF = "2026-09-22T12:01:00+00:00"
 
 
 def event(user, text, timestamp="2026-09-22T12:00:30+00:00", event_id=None):
-    metadata = {"event_id": event_id} if event_id else None
+    metadata = {"source": "fetch_protobuf"}
+    if event_id:
+        metadata["event_id"] = event_id
     return LIVE.normalize_event(
         "room-1", "comment", user, f"用户{user}", text,
         metadata=metadata, timestamp=timestamp, provider="douyin",
@@ -80,7 +82,8 @@ class R202RuleTests(unittest.TestCase):
         first = LIVE.replay_signals(events, rule_version="rules-v2", as_of=AS_OF)
         second = LIVE.replay_signals(events, rule_version="rules-v2", as_of=AS_OF)
         self.assertEqual(first, second)
-        self.assertNotEqual(first[0]["signal_id"], LIVE.replay_signals(events, rule_version="rules-v3", as_of=AS_OF)[0]["signal_id"])
+        with self.assertRaisesRegex(ValueError, "unsupported rule_version"):
+            LIVE.replay_signals(events, rule_version="rules-v3", as_of=AS_OF)
 
     def test_clear_threshold_and_cooldown_are_distinct(self):
         first_window = LIVE.replay_signals(

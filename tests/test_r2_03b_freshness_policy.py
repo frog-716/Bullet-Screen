@@ -5,6 +5,7 @@ import threading
 import time
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -136,6 +137,18 @@ class CollectorFreshnessPolicyTests(unittest.TestCase):
             self.collector.session_id = self.collector.store.start_session(
                 "douyin", self.context.room_id, "fixture room", self.context.room_url
             )
+            now = datetime.now(timezone.utc)
+            capture_started = (now - timedelta(minutes=10)).isoformat()
+            protocol_started = (now - timedelta(minutes=9)).isoformat()
+            self.collector.store.connection.execute(
+                "UPDATE live_sessions SET started_at=? WHERE id=?",
+                (capture_started, self.collector.session_id),
+            )
+            connecting_gap = self.collector.store.open_gap(
+                "douyin", self.context.room_id, self.collector.session_id,
+                self.context.run_id, "connecting", capture_started,
+            )
+            self.collector.store.close_gap(connecting_gap, protocol_started)
             self.collector._connected_monotonic = time.monotonic()
 
     def tearDown(self):

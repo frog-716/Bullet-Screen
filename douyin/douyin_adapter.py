@@ -1644,6 +1644,7 @@ class DouyinCollector:
         with self.lock:
             owner = self._context is context
             session_id = self.session_id if owner else None
+            protocol_was_verified = bool(self.last_protocol_at)
             if owner:
                 if session_id:
                     self.last_session_id = session_id
@@ -1654,7 +1655,11 @@ class DouyinCollector:
                         self.live_status = "unknown"
                         self.online = 0
         if session_id:
-            self.store.close_open_gaps(session_id, context.run_id)
+            self.store.close_open_gaps(
+                session_id,
+                context.run_id,
+                connecting_failure_reason=None if protocol_was_verified else "protocol_unavailable",
+            )
             self.store.end_session(session_id, terminal_status)
 
     def _state(self, context: RunContext, name: str, title: str) -> None:

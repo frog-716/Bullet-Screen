@@ -17,7 +17,7 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,6 +82,25 @@ def _acquire_database_lock(path: Path):
         handle.close()
         raise RuntimeError(f"database is already in use: {path}") from error
     return handle
+
+
+def _acquire_database_locks(paths: Iterable[Path]):
+    """Acquire a database set in one canonical order, unwinding partial locks."""
+    handles = []
+    ordered = sorted({Path(path) for path in paths}, key=lambda path: str(path.resolve()))
+    try:
+        for path in ordered:
+            handles.append(_acquire_database_lock(path))
+    except BaseException:
+        _release_database_locks(handles)
+        raise
+    return handles
+
+
+def _release_database_locks(handles) -> None:
+    for handle in reversed(handles):
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def _copy_database_snapshot(source: Path, destination: Path) -> None:
@@ -608,31 +627,104 @@ def drop_legacy_tables(connection: sqlite3.Connection) -> None:
 
 def _copy_bundle(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
+    _copy_file_durable(source, destination)
     for suffix in ("-wal", "-shm"):
         source_sidecar = source.with_name(source.name + suffix)
         destination_sidecar = destination.with_name(destination.name + suffix)
         if source_sidecar.exists():
-            shutil.copy2(source_sidecar, destination_sidecar)
+            _copy_file_durable(source_sidecar, destination_sidecar)
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _copy_file_durable(source: Path, destination: Path) -> None:
+    shutil.copy2(source, destination)
+    _fsync_file(destination)
+    _fsync_directory(destination.parent)
 
 
 def _remove_bundle(path: Path) -> None:
+    changed = False
     for suffix in ("-wal", "-shm"):
         sidecar = path.with_name(path.name + suffix)
         if sidecar.exists():
             sidecar.unlink()
+            changed = True
+    if changed:
+        _fsync_directory(path.parent)
 
 
 def _restore_bundle(original: Path, active: Path) -> None:
     _remove_bundle(active)
-    shutil.copy2(original, active)
+    _copy_file_durable(original, active)
     for suffix in ("-wal", "-shm"):
         original_sidecar = original.with_name(original.name + suffix)
         active_sidecar = active.with_name(active.name + suffix)
         if original_sidecar.exists():
-            shutil.copy2(original_sidecar, active_sidecar)
+            _copy_file_durable(original_sidecar, active_sidecar)
         elif active_sidecar.exists():
             active_sidecar.unlink()
+            _fsync_directory(active.parent)
+
+
+def _seal_candidate(path: Path, verify: Callable[[sqlite3.Connection], None]) -> None:
+    """Close/checkpoint a migrated candidate and verify its durable main file."""
+    connection = connect(path)
+    try:
+        mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        connection.commit()
+        if mode == "wal":
+            busy, log_frames, checkpointed_frames = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if busy or (log_frames >= 0 and checkpointed_frames != log_frames):
+                raise RuntimeError(f"candidate WAL checkpoint incomplete: {path}")
+            final_mode = str(connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
+            if final_mode != "delete":
+                raise RuntimeError(f"candidate journal mode could not be made self-contained: {path}")
+        verify(connection)
+    finally:
+        connection.close()
+
+    wal_path = path.with_name(path.name + "-wal")
+    if wal_path.exists() and wal_path.stat().st_size:
+        raise RuntimeError(f"candidate still has non-empty WAL after close: {path}")
+    for sidecar in (wal_path, path.with_name(path.name + "-shm")):
+        if sidecar.exists():
+            sidecar.unlink()
+    _fsync_file(path)
+    _fsync_directory(path.parent)
+
+    verification = connect(path)
+    try:
+        verify(verification)
+    finally:
+        verification.close()
+    if wal_path.exists() and wal_path.stat().st_size:
+        raise RuntimeError(f"candidate verification left a non-empty WAL: {path}")
+    for sidecar in (wal_path, path.with_name(path.name + "-shm")):
+        if sidecar.exists():
+            sidecar.unlink()
+    _fsync_file(path)
+    _fsync_directory(path.parent)
+
+
+def _seal_v4_candidate(path: Path, session_table: str, event_table: str) -> None:
+    _seal_candidate(path, lambda connection: _verify_v4_migration_target(connection, session_table, event_table))
 
 
 def _write_state(path: Path, payload: Dict[str, object]) -> None:
@@ -644,23 +736,50 @@ def _write_state(path: Path, payload: Dict[str, object]) -> None:
         os.close(directory_fd)
 
 
-def recover_migration(workspace: Path) -> bool:
-    """Roll back an interrupted switch using the durable switch state."""
-
+def _recover_migration_locked(workspace: Path) -> bool:
+    """Roll back an interrupted switch; caller must own every active DB lock."""
     state_path = Path(workspace) / "migration-state.json"
     if not state_path.exists():
         return False
     state = json.loads(state_path.read_text(encoding="utf-8"))
     if state.get("status") not in {"switching", "rollback-needed"}:
         return False
-    for item in state.get("databases", []):
+    databases = state.get("databases", [])
+    if not databases or any(not Path(item["original"]).exists() for item in databases):
+        raise RuntimeError("interrupted migration has no complete original database bundle")
+    for item in databases:
         active = Path(item["active"])
         original = Path(item["original"])
-        if original.exists():
-            _restore_bundle(original, active)
+        _restore_bundle(original, active)
     state["status"] = "rolled-back"
     _write_state(state_path, state)
     return True
+
+
+def recover_migration(workspace: Path) -> bool:
+    """Recover an interrupted switch while holding its active database locks."""
+    state_path = Path(workspace) / "migration-state.json"
+    if not state_path.exists():
+        return False
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("status") not in {"switching", "rollback-needed"}:
+        return False
+    databases = state.get("databases", [])
+    if not databases or any("active" not in item or "original" not in item for item in databases):
+        raise RuntimeError("interrupted migration journal has incomplete database identities")
+    active_paths = tuple(sorted({Path(item["active"]).resolve() for item in databases}, key=str))
+    handles = _acquire_database_locks(active_paths)
+    try:
+        current_state = json.loads(state_path.read_text(encoding="utf-8"))
+        current_paths = tuple(sorted(
+            {Path(item["active"]).resolve() for item in current_state.get("databases", [])},
+            key=str,
+        ))
+        if current_state.get("status") not in {"switching", "rollback-needed"} or current_paths != active_paths:
+            raise RuntimeError("migration journal changed while acquiring database locks")
+        return _recover_migration_locked(workspace)
+    finally:
+        _release_database_locks(handles)
 
 
 def apply_migration(
@@ -679,16 +798,8 @@ def apply_migration(
         raise FileNotFoundError(f"database does not exist: {missing}")
     if workspace.exists() and any(workspace.iterdir()):
         if (workspace / "migration-state.json").exists():
-            recovery_locks = []
-            try:
-                for path in (bilibili_path, douyin_path):
-                    recovery_locks.append(_acquire_database_lock(path))
-                if recover_migration(workspace):
-                    raise RehearsalFailure("recovered-interrupted-switch")
-            finally:
-                for lock in reversed(recovery_locks):
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                    lock.close()
+            if recover_migration(workspace):
+                raise RehearsalFailure("recovered-interrupted-switch")
         raise FileExistsError(f"migration workspace is not empty: {workspace}")
     workspace.mkdir(parents=True, exist_ok=True)
     source_dir = workspace / "source"
@@ -701,8 +812,7 @@ def apply_migration(
     source_connections = []
     staged_connections = []
     try:
-        for path in (bilibili_path, douyin_path):
-            lock_handles.append(_acquire_database_lock(path))
+        lock_handles.extend(_acquire_database_locks((bilibili_path, douyin_path)))
         source_paths = [source_dir / "bilibili.sqlite3", source_dir / "douyin.sqlite3"]
         for source, destination in zip((bilibili_path, douyin_path), source_paths):
             _copy_database_snapshot(source, destination)
@@ -731,6 +841,11 @@ def apply_migration(
         for connection in staged_connections:
             verify_database(connection)
         _fail_if_requested(fail_stage, "verify-after")
+        for connection in reversed(staged_connections):
+            connection.close()
+        staged_connections.clear()
+        for candidate in staging_paths:
+            _seal_candidate(candidate, verify_database)
         original_paths = [original_dir / "bilibili.sqlite3", original_dir / "douyin.sqlite3"]
         for source, original in zip((bilibili_path, douyin_path), original_paths):
             _copy_bundle(source, original)
@@ -755,13 +870,23 @@ def apply_migration(
                 try:
                     _remove_bundle(active)
                     os.replace(candidate, active)
+                    state["switched"].append(item["name"])
+                    _fsync_file(active)
+                    _fsync_directory(active.parent)
                 except Exception:
                     _restore_bundle(Path(item["original"]), active)
                     raise
-                state["switched"].append(item["name"])
                 _write_state(state_path, state)
                 if fail_stage == "switch":
                     raise RehearsalFailure("switch")
+            for active in (bilibili_path, douyin_path):
+                check = connect(active)
+                try:
+                    verify_database(check)
+                finally:
+                    check.close()
+            state["status"] = "applied"
+            _write_state(state_path, state)
         except Exception:
             for item in state["databases"]:
                 if item["name"] in state["switched"]:
@@ -771,14 +896,6 @@ def apply_migration(
             state["status"] = "rolled-back"
             _write_state(state_path, state)
             raise
-        state["status"] = "applied"
-        _write_state(state_path, state)
-        for active in (bilibili_path, douyin_path):
-            check = connect(active)
-            try:
-                verify_database(check)
-            finally:
-                check.close()
         return {
             "status": "applied",
             "backup": {"bilibili": str(original_paths[0]), "douyin": str(original_paths[1])},
@@ -789,9 +906,7 @@ def apply_migration(
             connection.close()
         for connection in reversed(source_connections):
             connection.close()
-        for lock in reversed(lock_handles):
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+        _release_database_locks(lock_handles)
 
 
 def _database_version(connection: sqlite3.Connection) -> int:
@@ -857,16 +972,16 @@ def apply_v4_migration(
         missing = bilibili_path if not bilibili_path.exists() else douyin_path
         raise FileNotFoundError(f"database does not exist: {missing}")
     if workspace.exists() and any(workspace.iterdir()):
-        if (workspace / "migration-state.json").exists() and recover_migration(workspace):
-            raise RehearsalFailure("recovered-interrupted-switch")
+        if (workspace / "migration-state.json").exists():
+            if recover_migration(workspace):
+                raise RehearsalFailure("recovered-interrupted-switch")
         raise FileExistsError(f"migration workspace is not empty: {workspace}")
 
     lock_handles = []
     source_connections = []
     staged_connections = []
     try:
-        for path in (bilibili_path, douyin_path):
-            lock_handles.append(_acquire_database_lock(path))
+        lock_handles.extend(_acquire_database_locks((bilibili_path, douyin_path)))
         versions = []
         for path, session_table, event_table in (
             (bilibili_path, "sessions", "events"),
@@ -922,6 +1037,17 @@ def apply_v4_migration(
             _verify_v4_migration_target(connection, session_table, event_table)
         _fail_if_requested(fail_stage, "verify-after")
 
+        for connection in reversed(staged_connections):
+            connection.commit()
+            connection.close()
+        staged_connections.clear()
+        for candidate, session_table, event_table in zip(
+            staging_paths,
+            ("sessions", "live_sessions"),
+            ("events", "live_events"),
+        ):
+            _seal_v4_candidate(candidate, session_table, event_table)
+
         original_paths = [original_dir / "bilibili.sqlite3", original_dir / "douyin.sqlite3"]
         for source, original in zip((bilibili_path, douyin_path), original_paths):
             _copy_bundle(source, original)
@@ -946,13 +1072,27 @@ def apply_v4_migration(
                 try:
                     _remove_bundle(active)
                     os.replace(candidate, active)
+                    state["switched"].append(item["name"])
+                    _fsync_file(active)
+                    _fsync_directory(active.parent)
                 except Exception:
                     _restore_bundle(Path(item["original"]), active)
                     raise
-                state["switched"].append(item["name"])
                 _write_state(state_path, state)
                 if fail_stage == "switch":
                     raise RehearsalFailure("switch")
+            for active in (bilibili_path, douyin_path):
+                connection = connect(active)
+                try:
+                    session_table, event_table = (
+                        ("sessions", "events") if active == bilibili_path
+                        else ("live_sessions", "live_events")
+                    )
+                    _verify_v4_migration_target(connection, session_table, event_table)
+                finally:
+                    connection.close()
+            state["status"] = "applied"
+            _write_state(state_path, state)
         except Exception:
             for item in state["databases"]:
                 if item["name"] in state["switched"]:
@@ -960,24 +1100,13 @@ def apply_v4_migration(
             state["status"] = "rolled-back"
             _write_state(state_path, state)
             raise
-        state["status"] = "applied"
-        _write_state(state_path, state)
-        for active in (bilibili_path, douyin_path):
-            connection = connect(active)
-            try:
-                session_table, event_table = ("sessions", "events") if active == bilibili_path else ("live_sessions", "live_events")
-                _verify_v4_migration_target(connection, session_table, event_table)
-            finally:
-                connection.close()
         return {"status": "applied", "backup": {"bilibili": str(original_paths[0]), "douyin": str(original_paths[1])}, "state": str(state_path)}
     finally:
         for connection in reversed(staged_connections):
             connection.close()
         for connection in reversed(source_connections):
             connection.close()
-        for lock in reversed(lock_handles):
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+        _release_database_locks(lock_handles)
 
 
 def main() -> None:

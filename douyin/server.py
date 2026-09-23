@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from douyin_adapter import BusyError, DouyinCollector, SnapshotUnstableError, _decode_im_event, _decode_im_response, parse_room_input, snapshot_window, snapshot_window_seconds
-from live_intelligence import SignalEngine, SignalFeedbackError, _window_bounds, add_signal_feedback, analyze_text, load_signals, normalize_event, persist_signal
+from live_intelligence import SignalEngine, SignalFeedbackError, _window_bounds, add_signal_feedback, analyze_text, evaluate_coverage_window, load_signals, normalize_event, persist_signal
 
 
 ROOT = Path(__file__).resolve().parent
@@ -225,6 +225,7 @@ class RunContext:
     room_id: str
     sessdata: str = field(repr=False)
     cancel: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    capture_verified: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
 
 
 def acquire_database_lock(path: Path) -> Any:
@@ -849,14 +850,42 @@ class EventStore:
             self.connection.commit()
             return cursor.rowcount == 1
 
-    def close_open_gaps(self, session_id: int, run_id: Optional[str] = None, ended_at: Optional[str] = None) -> int:
+    def close_open_gaps(
+        self,
+        session_id: int,
+        run_id: Optional[str] = None,
+        ended_at: Optional[str] = None,
+        *,
+        preserve_connecting: bool = False,
+        connecting_failure_reason: Optional[str] = None,
+    ) -> int:
         with self.lock:
+            timestamp = ended_at or utc_now()
+            closed = 0
+            if connecting_failure_reason:
+                scope = "session_id=? AND status='open' AND reason='connecting'"
+                parameters: Tuple[Any, ...] = (connecting_failure_reason, timestamp, session_id)
+                if run_id is not None:
+                    scope += " AND run_id=?"
+                    parameters += (run_id,)
+                cursor = self.connection.execute(
+                    f"UPDATE capture_gaps SET reason=?,gap_end=?,status='closed' WHERE {scope}",
+                    parameters,
+                )
+                closed += cursor.rowcount
+            excluded = " AND reason!='connecting'" if preserve_connecting else ""
             if run_id is None:
-                cursor = self.connection.execute("UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND status='open'", (ended_at or utc_now(), session_id))
+                cursor = self.connection.execute(
+                    "UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND status='open'" + excluded,
+                    (timestamp, session_id),
+                )
             else:
-                cursor = self.connection.execute("UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND run_id=? AND status='open'", (ended_at or utc_now(), session_id, run_id))
+                cursor = self.connection.execute(
+                    "UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND run_id=? AND status='open'" + excluded,
+                    (timestamp, session_id, run_id),
+                )
             self.connection.commit()
-            return cursor.rowcount
+            return closed + cursor.rowcount
 
     def gaps(self, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
         with self.lock:
@@ -864,30 +893,19 @@ class EventStore:
         return [dict(row) for row in rows]
 
     def coverage(self, session_id: int, start: str, end: str) -> Dict[str, Any]:
-        start_dt = parse_utc_timestamp(start)
-        end_dt = parse_utc_timestamp(end)
-        if start_dt is None or end_dt is None or end_dt <= start_dt:
-            raise ValueError("coverage window must contain valid ordered timestamps")
-        rows = [
-            gap for gap in self.gaps(session_id)
-            if (gap_start := parse_utc_timestamp(gap["gap_start"])) is not None
-            and gap_start < end_dt
-            and (gap["gap_end"] is None or (gap_end := parse_utc_timestamp(gap["gap_end"])) is None or gap_end > start_dt)
-        ]
+        gaps = self.gaps(session_id)
         with self.lock:
+            session = self.connection.execute("SELECT started_at,ended_at FROM sessions WHERE id=?", (session_id,)).fetchone()
             event_times = [row[0] for row in self.connection.execute("SELECT event_time FROM events WHERE session_id=?", (session_id,))]
             snapshot_times = [row[0] for row in self.connection.execute("SELECT recorded_at FROM metric_snapshots WHERE session_id=?", (session_id,))]
-        event_count = sum(1 for value in event_times if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt)
-        snapshot_count = sum(1 for value in snapshot_times if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt)
-        if rows:
-            coverage_state = "gap"
-        elif event_count:
-            coverage_state = "reliable_with_data"
-        elif snapshot_count:
-            coverage_state = "reliable_no_events"
-        else:
-            coverage_state = "unknown"
-        return {"session_id": session_id, "start": start, "end": end, "coverage_state": coverage_state, "complete": coverage_state in {"reliable_with_data", "reliable_no_events"}, "has_open_gap": any(gap["gap_end"] is None for gap in rows), "event_count": event_count, "snapshot_count": snapshot_count, "gaps": rows}
+        return evaluate_coverage_window(
+            session_id=session_id, start=start, end=end,
+            session_started_at=session["started_at"] if session else None,
+            session_ended_at=session["ended_at"] if session else None,
+            gaps=gaps,
+            events=[{"time": value, "trusted": True} for value in event_times],
+            snapshot_times=snapshot_times,
+        )
 
     def close(self) -> None:
         with self.lock:
@@ -1105,7 +1123,7 @@ class Collector:
                 self.status_name = "connected"
                 self.last_error = ""
             if self.session_id:
-                self.store.close_open_gaps(self.session_id, context.run_id)
+                self.store.close_open_gaps(self.session_id, context.run_id, preserve_connecting=True)
             return True
 
     def _expire_stale_locked(self) -> None:
@@ -1351,7 +1369,11 @@ class Collector:
                 if self.status_name in {"connecting", "authenticating", "connected", "stale", "stopping"}:
                     self.status_name = "error" if terminal_status == "error" else "stopped"
         if session_id:
-            self.store.close_open_gaps(session_id, context.run_id)
+            self.store.close_open_gaps(
+                session_id,
+                context.run_id,
+                connecting_failure_reason=None if context.capture_verified.is_set() else "protocol_unavailable",
+            )
             self.store.end_session(session_id, terminal_status)
 
     def _receive_loop(self, context: RunContext, ws: WebSocketClient) -> None:
@@ -1412,6 +1434,7 @@ class Collector:
                     if (context is None or self._context is context) and self.status_name == "authenticating":
                         self.status_name = "connected"
                         if context is not None and self.session_id:
+                            context.capture_verified.set()
                             self.store.close_open_gaps(self.session_id, context.run_id)
                 continue
             if operation == 3 and len(body) >= 4:

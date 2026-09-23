@@ -284,12 +284,19 @@ class CoverageRepairTests(unittest.TestCase):
         session = store.start_session("douyin", "room", "title", "url")
         start = "2026-09-21T09:00:00+08:00"
         end = "2026-09-21T10:00:00+08:00"
+        store.connection.execute(
+            "UPDATE live_sessions SET started_at=?,ended_at=?,status='stopped' WHERE id=?",
+            ("2026-09-21T00:00:00Z", "2026-09-21T02:00:00Z", session),
+        )
+        store.connection.commit()
         self.assertEqual(store.coverage(session, start, end)["coverage_state"], "unknown")
+        connecting_gap = store.open_gap("douyin", "room", session, "run-1", "connecting", "2026-09-21T00:00:00Z")
+        store.close_gap(connecting_gap, "2026-09-21T00:01:00Z")
         store.insert_snapshot(session, {"online": None})
         store.connection.execute("UPDATE live_metric_snapshots SET recorded_at=? WHERE session_id=?", ("2026-09-21T01:15:00+00:00", session))
         store.connection.commit()
         self.assertEqual(store.coverage(session, start, end)["coverage_state"], "reliable_no_events")
-        store.insert_event(session, {"provider": "douyin", "room_id": "room", "type": "comment", "content": "hi", "timestamp": "2026-09-21T01:30:00Z"})
+        store.insert_event(session, {"provider": "douyin", "room_id": "room", "type": "comment", "content": "hi", "timestamp": "2026-09-21T01:30:00Z", "metadata": {"source": "fetch_protobuf"}})
         self.assertEqual(store.coverage(session, start, end)["coverage_state"], "reliable_with_data")
         gap = store.open_gap("douyin", "room", session, "run-1", "stale", started_at="2026-09-21T01:45:00Z")
         self.assertEqual(store.coverage(session, start, end)["coverage_state"], "gap")

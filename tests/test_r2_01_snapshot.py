@@ -4,6 +4,7 @@ import json
 import sys
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -33,6 +34,12 @@ class SnapshotFixtures:
         store = module.EventStore(":memory:")
         collector = module.Collector(store)
         session_id = store.start_session("100", "测试房间")
+        now = datetime.now(timezone.utc)
+        capture_started = (now - timedelta(minutes=10)).isoformat()
+        protocol_started = (now - timedelta(minutes=9)).isoformat()
+        store.connection.execute("UPDATE sessions SET started_at=? WHERE id=?", (capture_started, session_id))
+        connection_gap = store.open_gap("bilibili", "100", session_id, "run-1", "connecting", capture_started)
+        store.close_gap(connection_gap, protocol_started)
         collector.generation = 1
         collector._context = module.RunContext(1, "run-1", "bilibili", "100", "")
         collector.session_id = session_id
@@ -163,6 +170,12 @@ class SnapshotContractTests(unittest.TestCase):
         store = BILIBILI.EventStore(":memory:")
         collector = BILIBILI.Collector(store)
         session_id = store.start_session("100", "空窗口")
+        now = datetime.now(timezone.utc)
+        capture_started = (now - timedelta(minutes=10)).isoformat()
+        protocol_started = (now - timedelta(minutes=9)).isoformat()
+        store.connection.execute("UPDATE sessions SET started_at=? WHERE id=?", (capture_started, session_id))
+        connection_gap = store.open_gap("bilibili", "100", session_id, "run-1", "connecting", capture_started)
+        store.close_gap(connection_gap, protocol_started)
         collector.generation = 1
         collector._context = BILIBILI.RunContext(1, "run-1", "bilibili", "100", "")
         collector.session_id = session_id

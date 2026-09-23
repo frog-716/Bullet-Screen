@@ -41,7 +41,7 @@ class FeedbackHttpTests(unittest.TestCase):
             } for row in rows]
         else:
             for uid in ("u1", "u2"):
-                store.insert_event(session_id, LIVE.normalize_event(room_id, "comment", uid, uid, "想买", timestamp=now, metadata={"event_id": uid}))
+                store.insert_event(session_id, LIVE.normalize_event(room_id, "comment", uid, uid, "想买", timestamp=now, metadata={"event_id": uid, "source": "fetch_protobuf"}))
             normalized = store.recent_events(session_id, None)
         signal = LIVE.replay_signals(normalized, as_of=now, provider=provider, room_id=room_id, session_id=session_id, run_id="run-http")[0]
         LIVE.persist_signal(store.connection, signal, event_table)

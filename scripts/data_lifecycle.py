@@ -237,6 +237,7 @@ def _copy_hash(source: Path, destination: Path) -> Tuple[int, str]:
             size += len(block)
         outgoing.flush()
         os.fsync(outgoing.fileno())
+    _fsync_file(destination)
     return size, digest.hexdigest()
 
 
@@ -379,6 +380,96 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_tree(directory: Path) -> None:
+    directories = [directory]
+    for current, children, _filenames in os.walk(directory, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories.extend(current_path / name for name in children)
+    for path in _walk_regular_files(directory):
+        _fsync_file(path)
+    for path in sorted(set(directories), key=lambda item: len(item.parts), reverse=True):
+        _fsync_directory(path)
+
+
+def _tree_signature(directory: Path) -> List[Dict[str, object]]:
+    signature = []
+    for path in _walk_regular_files(directory):
+        size, digest = _file_signature(path)
+        signature.append({"path": path.relative_to(directory).as_posix(), "size": size, "sha256": digest})
+    return signature
+
+
+def _file_signature(path: Path) -> Tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise LifecycleError("只能校验普通文件")
+    with os.fdopen(descriptor, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+    return size, digest.hexdigest()
+
+
+def _path_signature(path: Path, kind: str) -> Dict[str, object]:
+    if _is_symlink(path):
+        raise LifecycleError("恢复目标出现符号链接；保留日志等待人工检查")
+    if not path.exists():
+        return {"present": False}
+    if kind in ("directory", "cache-directory"):
+        if not path.is_dir():
+            return {"present": False, "invalid": True}
+        return {"present": True, "files": _tree_signature(path)}
+    if not path.is_file():
+        return {"present": False, "invalid": True}
+    size, digest = _file_signature(path)
+    return {"present": True, "size": size, "sha256": digest}
+
+
+def _operation_matches(
+    root: Path,
+    profile_path: Path,
+    transaction_root: Path,
+    operation: Dict[str, object],
+    signature_key: str,
+) -> bool:
+    expected = operation.get(signature_key)
+    if not isinstance(expected, dict):
+        return False
+    target = _operation_target(root, profile_path, operation)
+    try:
+        return _path_signature(target, str(operation.get("kind"))) == expected
+    except (OSError, LifecycleError):
+        return False
+
+
+def _all_operations_match(
+    root: Path,
+    profile_path: Path,
+    transaction_root: Path,
+    operations: Sequence[Dict[str, object]],
+    signature_key: str,
+) -> bool:
+    return all(_operation_matches(root, profile_path, transaction_root, item, signature_key) for item in operations)
+
+
+def _remove_transaction_tree(transaction_root: Path) -> None:
+    if transaction_root.exists():
+        shutil.rmtree(transaction_root)
+        if transaction_root.parent.exists():
+            _fsync_directory(transaction_root.parent)
+
+
 def _safe_archive_relative(value: object) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise LifecycleError("备份清单含有无效路径")
@@ -519,6 +610,9 @@ def _copy_tree_secure(source: Path, destination: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _copy_hash(source_file, target)
         os.chmod(target, 0o600)
+        _fsync_file(target)
+    _fsync_tree(destination)
+    _fsync_directory(destination.parent)
 
 
 def _prepare_transaction(
@@ -535,6 +629,8 @@ def _prepare_transaction(
     original_root = transaction_root / "original"
     staging_root.mkdir(parents=True, mode=0o700)
     original_root.mkdir(mode=0o700)
+    _fsync_directory(root / LIFECYCLE_DIRNAME)
+    _fsync_directory(root)
     journal_path = transaction_root / "journal.json"
     journal = {
         "format": "bullet-screen-data-lifecycle-journal-v1",
@@ -549,7 +645,7 @@ def _prepare_transaction(
         _write_json_durable(journal_path, journal)
         _write_json_durable(marker_root / LIFECYCLE_MARKER, {"transaction_id": transaction_id})
     except BaseException:
-        shutil.rmtree(transaction_root, ignore_errors=True)
+        _remove_transaction_tree(transaction_root)
         raise
 
     try:
@@ -564,6 +660,7 @@ def _prepare_transaction(
                     if "profile_entries" in operation:
                         staged.mkdir(mode=0o700)
                         seen = set()
+                        staged_entries = []
                         for item in operation.pop("profile_entries"):
                             relative = _safe_archive_relative(item["relative"])
                             if relative in seen:
@@ -576,16 +673,30 @@ def _prepare_transaction(
                             if copied_size != item["expected_size"] or copied_hash != item["expected_sha256"]:
                                 raise LifecycleError("恢复来源在校验后发生变化；没有切换任何数据")
                             os.chmod(destination, 0o600)
+                            _fsync_file(destination)
+                            staged_entries.append({
+                                "path": relative,
+                                "size": copied_size,
+                                "sha256": copied_hash,
+                            })
+                        _fsync_tree(staged)
+                        _fsync_directory(staged.parent)
+                        operation["desired_signature"] = {"present": True, "files": staged_entries}
                     else:
                         _copy_tree_secure(Path(operation["source_path"]), staged)
+                        operation["desired_signature"] = _path_signature(staged, str(operation["kind"]))
                     operation["staging"] = str(staged.relative_to(transaction_root))
+                else:
+                    operation["desired_signature"] = {"present": False}
                 if target.exists():
                     original = original_root / str(index)
                     _copy_tree_secure(target, original)
                     operation["original"] = str(original.relative_to(transaction_root))
                     operation["had_original"] = True
+                    operation["original_signature"] = _path_signature(original, str(operation["kind"]))
                 else:
                     operation["had_original"] = False
+                    operation["original_signature"] = {"present": False}
             else:
                 _assert_no_symlink_components(target)
                 if target.exists() and (not target.is_file() or _is_symlink(target)):
@@ -598,13 +709,22 @@ def _prepare_transaction(
                     if "expected_sha256" in operation and copied_hash != operation["expected_sha256"]:
                         raise LifecycleError("恢复来源在校验后发生变化；没有切换任何数据")
                     operation["staging"] = str(staged.relative_to(transaction_root))
+                    operation["desired_signature"] = {
+                        "present": True, "size": copied_size, "sha256": copied_hash,
+                    }
+                else:
+                    operation["desired_signature"] = {"present": False}
                 if target.exists():
                     original = original_root / str(index)
-                    _copy_hash(target, original)
+                    original_size, original_hash = _copy_hash(target, original)
                     operation["original"] = str(original.relative_to(transaction_root))
                     operation["had_original"] = True
+                    operation["original_signature"] = {
+                        "present": True, "size": original_size, "sha256": original_hash,
+                    }
                 else:
                     operation["had_original"] = False
+                    operation["original_signature"] = {"present": False}
             operation.pop("source_path", None)
             if fail_stage == "during-prepare" and index == 0:
                 raise SimulatedInterruption("during-prepare")
@@ -616,13 +736,15 @@ def _prepare_transaction(
         raise
     except BaseException:
         _remove_lifecycle_marker(marker_root)
-        shutil.rmtree(transaction_root, ignore_errors=True)
+        _remove_transaction_tree(transaction_root)
         raise
     if fail_stage == "before-switch":
         raise SimulatedInterruption("before-switch")
 
     journal["status"] = "switching"
     _write_json_durable(journal_path, journal)
+    if fail_stage == "after-switching-journal":
+        raise SimulatedInterruption("after-switching-journal")
     try:
         for index, operation in enumerate(operations):
             target = _operation_target(root, profile_path, operation)
@@ -632,35 +754,58 @@ def _prepare_transaction(
                     if _is_symlink(target):
                         raise LifecycleError("恢复期间发现符号链接目标；已停止")
                     shutil.rmtree(target)
+                    _fsync_directory(target.parent)
+                    if fail_stage == "profile-after-remove" and operation["target"] == "@profile":
+                        raise SimulatedInterruption("profile-after-remove")
                 if operation.get("new_present"):
                     staged = _transaction_child(transaction_root, operation["staging"])
                     os.replace(staged, target)
+                    _fsync_tree(target)
+                    _fsync_directory(target.parent)
             else:
                 if operation.get("new_present"):
                     staged = _transaction_child(transaction_root, operation["staging"])
                     os.replace(staged, target)
+                    _fsync_file(target)
+                    _fsync_directory(target.parent)
                 elif target.exists():
                     if _is_symlink(target):
                         raise LifecycleError("恢复期间发现符号链接目标；已停止")
                     target.unlink()
+                    _fsync_directory(target.parent)
+            operation["switch_state"] = "durable"
             journal["completed"] = index + 1
             _write_json_durable(journal_path, journal)
             if fail_stage == "after-first-switch" and index == 0:
                 raise SimulatedInterruption("after-first-switch")
             if fail_stage == "switch-error-after-first" and index == 0:
                 raise OSError("simulated switch failure")
+            if fail_stage == "after-operation-journal" and index == 0:
+                raise SimulatedInterruption("after-operation-journal")
+            if fail_stage == "after-wal-switch" and str(operation["target"]).endswith("-wal"):
+                raise SimulatedInterruption("after-wal-switch")
+            if fail_stage == "after-profile-switch" and operation["target"] == "@profile":
+                raise SimulatedInterruption("after-profile-switch")
+        journal["status"] = "verifying"
+        _write_json_durable(journal_path, journal)
+        if not _all_operations_match(root, profile_path, transaction_root, operations, "desired_signature"):
+            raise LifecycleError("最终目标校验失败；正在恢复操作前的状态")
         journal["status"] = "applied"
         _write_json_durable(journal_path, journal)
+        if fail_stage == "after-applied":
+            raise SimulatedInterruption("after-applied")
     except SimulatedInterruption:
         raise
     except Exception:
         _rollback_transaction(root, profile_path, transaction_root, journal)
+        if not _all_operations_match(root, profile_path, transaction_root, operations, "original_signature"):
+            raise LifecycleError("回滚后的目标校验失败；保留恢复日志等待处理")
         _remove_lifecycle_marker(marker_root)
-        shutil.rmtree(transaction_root, ignore_errors=True)
+        _remove_transaction_tree(transaction_root)
         raise
 
     _remove_lifecycle_marker(marker_root)
-    shutil.rmtree(transaction_root, ignore_errors=True)
+    _remove_transaction_tree(transaction_root)
     return transaction_id
 
 
@@ -689,9 +834,11 @@ def _rollback_transaction(root: Path, profile_path: Path, transaction_root: Path
                 if _is_symlink(target):
                     raise LifecycleError("恢复目标出现符号链接；保留日志等待人工检查")
                 shutil.rmtree(target)
+                _fsync_directory(target.parent)
             if operation.get("had_original"):
                 original = _transaction_child(transaction_root, operation.get("original", ""))
                 _copy_tree_secure(original, target)
+                _fsync_directory(target.parent)
         else:
             if operation.get("had_original"):
                 original = _transaction_child(transaction_root, operation.get("original", ""))
@@ -699,10 +846,13 @@ def _rollback_transaction(root: Path, profile_path: Path, transaction_root: Path
                 temporary = target.with_name(target.name + ".restore-tmp-" + uuid.uuid4().hex)
                 _copy_hash(original, temporary)
                 os.replace(temporary, target)
+                _fsync_file(target)
+                _fsync_directory(target.parent)
             elif target.exists():
                 if _is_symlink(target):
                     raise LifecycleError("恢复目标出现符号链接；保留日志等待人工检查")
                 target.unlink()
+                _fsync_directory(target.parent)
     _fsync_directory(transaction_root)
 
 
@@ -756,15 +906,29 @@ def recover_lifecycle(root: Path, profile_path: Optional[Path] = None) -> bool:
                     providers.add(provider)
     with _locked_targets(root, providers, profile_path if touches_profile else None):
         status = journal.get("status")
-        if status == "preparing":
+        operations = journal.get("operations")
+        if not isinstance(operations, list) or not all(isinstance(item, dict) for item in operations):
+            raise LifecycleError("恢复日志损坏；保留现场等待人工检查")
+        if status in {"preparing", "prepared"}:
             print("操作中断在准备阶段，尚未切换目标；已清理临时副本。", file=sys.stdout)
-        elif status != "applied":
-            _rollback_transaction(root, profile_path, transaction_root, journal)
-            print("已恢复到本地数据操作前的状态。", file=sys.stdout)
+        elif status in {"switching", "verifying", "applied", "rollback-needed", "rolling-back"}:
+            if _all_operations_match(root, profile_path, transaction_root, operations, "desired_signature"):
+                journal["status"] = "applied"
+                _write_json_durable(journal_path, journal)
+                print("所有目标均已通过复核；完成了中断的切换。", file=sys.stdout)
+            elif _all_operations_match(root, profile_path, transaction_root, operations, "original_signature"):
+                print("目标仍是操作前状态；清理了未切换的事务副本。", file=sys.stdout)
+            else:
+                journal["status"] = "rollback-needed"
+                _write_json_durable(journal_path, journal)
+                _rollback_transaction(root, profile_path, transaction_root, journal)
+                if not _all_operations_match(root, profile_path, transaction_root, operations, "original_signature"):
+                    raise LifecycleError("恢复后的目标仍未通过校验；保留日志等待人工处理")
+                print("检测到部分切换；已恢复到本地数据操作前的状态。", file=sys.stdout)
         else:
-            print("数据切换已完成；清理了中断遗留的恢复标记。", file=sys.stdout)
+            raise LifecycleError("恢复日志状态未知；保留数据等待人工检查")
         _remove_lifecycle_marker(marker_root)
-        shutil.rmtree(transaction_root, ignore_errors=True)
+        _remove_transaction_tree(transaction_root)
     return True
 
 

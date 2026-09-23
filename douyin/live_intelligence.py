@@ -67,6 +67,7 @@ STOP_WORDS = {
 CHINA_TIMEZONE = timezone(timedelta(hours=8))
 SCHEMA_VERSION = V4_SCHEMA_VERSION
 RULE_VERSION = "rules-v2"
+TRUSTED_DOYIN_CAPTURE_SOURCES = frozenset({"fetch_protobuf"})
 SIGNAL_WINDOW_SECONDS = 60
 SIGNAL_TRIGGER_EVENT_COUNT = 2
 SIGNAL_TRIGGER_UNIQUE_USERS = 2
@@ -222,6 +223,81 @@ def parse_utc_timestamp(value: Any) -> Optional[datetime]:
         return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def evaluate_coverage_window(
+    *,
+    session_id: int,
+    start: str,
+    end: str,
+    session_started_at: Optional[str],
+    session_ended_at: Optional[str],
+    gaps: Sequence[Dict[str, Any]],
+    events: Sequence[Dict[str, Any]],
+    snapshot_times: Sequence[Any],
+) -> Dict[str, Any]:
+    """Classify a complete requested interval, not merely rows inside it."""
+    start_dt = parse_utc_timestamp(start)
+    end_dt = parse_utc_timestamp(end)
+    session_start_dt = parse_utc_timestamp(session_started_at)
+    session_end_dt = parse_utc_timestamp(session_ended_at) if session_ended_at else end_dt
+    if start_dt is None or end_dt is None or end_dt <= start_dt:
+        raise ValueError("coverage window must contain valid ordered timestamps")
+
+    overlapping_gaps = []
+    for gap in gaps:
+        gap_start = parse_utc_timestamp(gap.get("gap_start"))
+        gap_end = parse_utc_timestamp(gap.get("gap_end")) if gap.get("gap_end") else None
+        if gap_start is not None and gap_start < end_dt and (gap_end is None or gap_end > start_dt):
+            overlapping_gaps.append(gap)
+
+    state = "unknown"
+    event_count = 0
+    snapshot_count = 0
+    if session_start_dt is not None and session_end_dt is not None:
+        # Before a session exists or after it ended, there is no capture evidence.
+        if start_dt >= session_start_dt and end_dt <= session_end_dt:
+            if overlapping_gaps:
+                state = "gap"
+            else:
+                connection_gaps = sorted(
+                    (gap for gap in gaps if gap.get("reason") == "connecting"),
+                    key=lambda gap: parse_utc_timestamp(gap.get("gap_start")) or datetime.max.replace(tzinfo=timezone.utc),
+                )
+                first_connection_end = (
+                    parse_utc_timestamp(connection_gaps[0].get("gap_end")) if connection_gaps else None
+                )
+                if first_connection_end is not None and start_dt >= first_connection_end:
+                    in_window = []
+                    for event in events:
+                        event_time = parse_utc_timestamp(event.get("time"))
+                        if event_time is not None and start_dt <= event_time < end_dt:
+                            in_window.append(event)
+                    event_count = len(in_window)
+                    trusted_events = sum(1 for event in in_window if event.get("trusted") is True)
+                    untrusted_events = event_count - trusted_events
+                    snapshot_count = sum(
+                        1 for value in snapshot_times
+                        if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt
+                    )
+                    if trusted_events:
+                        state = "reliable_with_data"
+                    elif untrusted_events:
+                        state = "unknown"
+                    elif snapshot_count:
+                        state = "reliable_no_events"
+
+    return {
+        "session_id": session_id,
+        "start": start,
+        "end": end,
+        "coverage_state": state,
+        "complete": state in {"reliable_with_data", "reliable_no_events"},
+        "has_open_gap": any(gap.get("gap_end") is None for gap in overlapping_gaps),
+        "event_count": event_count,
+        "snapshot_count": snapshot_count,
+        "gaps": overlapping_gaps,
+    }
 
 
 def _clean_text(value: Any, limit: int = 500) -> str:
@@ -680,20 +756,42 @@ class LiveEventStore:
             self.connection.commit()
             return cursor.rowcount == 1
 
-    def close_open_gaps(self, session_id: int, run_id: Optional[str] = None, ended_at: Optional[str] = None) -> int:
+    def close_open_gaps(
+        self,
+        session_id: int,
+        run_id: Optional[str] = None,
+        ended_at: Optional[str] = None,
+        *,
+        connecting_failure_reason: Optional[str] = None,
+    ) -> int:
         with self.lock:
+            timestamp = ended_at or utc_now()
+            closed = 0
+            if connecting_failure_reason:
+                if run_id is None:
+                    cursor = self.connection.execute(
+                        "UPDATE capture_gaps SET reason=?,gap_end=?,status='closed' WHERE session_id=? AND status='open' AND reason='connecting'",
+                        (connecting_failure_reason, timestamp, session_id),
+                    )
+                else:
+                    cursor = self.connection.execute(
+                        "UPDATE capture_gaps SET reason=?,gap_end=?,status='closed' WHERE session_id=? AND run_id=? AND status='open' AND reason='connecting'",
+                        (connecting_failure_reason, timestamp, session_id, run_id),
+                    )
+                closed += cursor.rowcount
             if run_id is None:
                 cursor = self.connection.execute(
                     "UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND status='open'",
-                    (ended_at or utc_now(), session_id),
+                    (timestamp, session_id),
                 )
             else:
                 cursor = self.connection.execute(
                     "UPDATE capture_gaps SET gap_end=?, status='closed' WHERE session_id=? AND run_id=? AND status='open'",
-                    (ended_at or utc_now(), session_id, run_id),
+                    (timestamp, session_id, run_id),
                 )
+            closed += cursor.rowcount
             self.connection.commit()
-            return cursor.rowcount
+            return closed
 
     def gaps(self, session_id: Optional[int] = None) -> List[Dict[str, Any]]:
         with self.lock:
@@ -704,36 +802,33 @@ class LiveEventStore:
         return [dict(row) for row in rows]
 
     def coverage(self, session_id: int, start: str, end: str) -> Dict[str, Any]:
-        start_dt = parse_utc_timestamp(start)
-        end_dt = parse_utc_timestamp(end)
-        if start_dt is None or end_dt is None or end_dt <= start_dt:
-            raise ValueError("coverage window must contain valid ordered timestamps")
-        rows = [
-            gap for gap in self.gaps(session_id)
-            if (gap_start := parse_utc_timestamp(gap["gap_start"])) is not None
-            and gap_start < end_dt
-            and (gap["gap_end"] is None or (gap_end := parse_utc_timestamp(gap["gap_end"])) is None or gap_end > start_dt)
-        ]
+        gaps = self.gaps(session_id)
         with self.lock:
-            event_times = [row[0] for row in self.connection.execute("SELECT event_time FROM live_events WHERE session_id=?", (session_id,))]
+            session = self.connection.execute(
+                "SELECT started_at,ended_at FROM live_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            event_rows = self.connection.execute(
+                "SELECT event_time,metadata_json FROM live_events WHERE session_id=?", (session_id,)
+            ).fetchall()
             snapshot_times = [row[0] for row in self.connection.execute("SELECT recorded_at FROM live_metric_snapshots WHERE session_id=?", (session_id,))]
-        event_count = sum(1 for value in event_times if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt)
-        snapshot_count = sum(1 for value in snapshot_times if (timestamp := parse_utc_timestamp(value)) is not None and start_dt <= timestamp < end_dt)
-        if rows:
-            coverage_state = "gap"
-        elif event_count:
-            coverage_state = "reliable_with_data"
-        elif snapshot_count:
-            coverage_state = "reliable_no_events"
-        else:
-            coverage_state = "unknown"
-        return {
-            "session_id": session_id, "start": start, "end": end,
-            "coverage_state": coverage_state,
-            "complete": coverage_state in {"reliable_with_data", "reliable_no_events"},
-            "has_open_gap": any(gap["gap_end"] is None for gap in rows),
-            "event_count": event_count, "snapshot_count": snapshot_count, "gaps": rows,
-        }
+        events = []
+        for row in event_rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            source = metadata.get("source") if isinstance(metadata, dict) else None
+            events.append({"time": row["event_time"], "trusted": source in TRUSTED_DOYIN_CAPTURE_SOURCES})
+        return evaluate_coverage_window(
+            session_id=session_id,
+            start=start,
+            end=end,
+            session_started_at=session["started_at"] if session else None,
+            session_ended_at=session["ended_at"] if session else None,
+            gaps=gaps,
+            events=events,
+            snapshot_times=snapshot_times,
+        )
 
     def close(self) -> None:
         with self.lock:
@@ -831,8 +926,8 @@ def evaluate_signal_window(
 ) -> List[Dict[str, Any]]:
     """Evaluate one deterministic window without I/O or wall-clock access."""
 
-    if not str(rule_version or "").strip():
-        raise ValueError("rule_version is required")
+    if rule_version != RULE_VERSION:
+        raise ValueError(f"unsupported rule_version: {rule_version}")
     if coverage not in {"reliable_with_data", "reliable_no_events", "gap", "unknown"}:
         raise ValueError(f"unsupported coverage: {coverage}")
     as_of_text = _as_utc_text(as_of)
@@ -841,6 +936,23 @@ def evaluate_signal_window(
     for signal_type in ("purchase_intent", "recommendation"):
         previous_signal = _previous_signal(previous, signal_type)
         candidates = _candidate_events(events, signal_type, window_start, window_end)
+        effective_coverage = coverage
+        if provider == "douyin":
+            verified = [
+                event for event in candidates
+                if isinstance(event.get("metadata"), dict)
+                and event["metadata"].get("source") in TRUSTED_DOYIN_CAPTURE_SOURCES
+            ]
+            verified_qualifies = (
+                len(verified) >= SIGNAL_TRIGGER_EVENT_COUNT
+                and len({_user_key(event) for event in verified}) >= SIGNAL_TRIGGER_UNIQUE_USERS
+            )
+            if verified_qualifies:
+                candidates = verified
+            else:
+                # DOM and synthetic observations can be retained as weak evidence,
+                # but cannot promote a Douyin signal or its coverage to reliable.
+                effective_coverage = "unknown"
         event_count = len(candidates)
         unique_user_count = len({_user_key(event) for event in candidates})
         qualifies = event_count >= SIGNAL_TRIGGER_EVENT_COUNT and unique_user_count >= SIGNAL_TRIGGER_UNIQUE_USERS
@@ -858,10 +970,10 @@ def evaluate_signal_window(
         if qualifies:
             status = "active"
             same_window = bool(previous_signal and previous_signal.get("window_end") == window_end)
-            strength = "strong" if coverage == "reliable_with_data" and (not in_cooldown or same_window) else "moderate" if coverage == "reliable_with_data" else "weak"
+            strength = "strong" if effective_coverage == "reliable_with_data" and (not in_cooldown or same_window) else "moderate" if effective_coverage == "reliable_with_data" else "weak"
         elif prior_active and (in_cooldown or holdable):
             status = "active"
-            strength = "moderate" if coverage == "reliable_with_data" else "weak"
+            strength = "moderate" if effective_coverage == "reliable_with_data" else "weak"
         else:
             status = "cleared"
             strength = "weak"
@@ -879,12 +991,12 @@ def evaluate_signal_window(
             "as_of": as_of_text,
             "window_start": window_start,
             "window_end": window_end,
-            "coverage": coverage,
+            "coverage": effective_coverage,
             "event_count": event_count,
             "unique_user_count": unique_user_count,
             "status": status,
             "strength": strength,
-            "reason": _signal_reason(signal_type, event_count, unique_user_count, coverage, status),
+            "reason": _signal_reason(signal_type, event_count, unique_user_count, effective_coverage, status),
             "evidence_event_ids": evidence_ids,
             "evidence_row_ids": row_ids,
             "cooldown": in_cooldown,
