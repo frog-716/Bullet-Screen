@@ -48,17 +48,17 @@ function testStateHelpers(api) {
     assert.strictEqual(quiet.protocolHealth, "healthy");
     assert.strictEqual(quiet.protocolAvailable, "true");
     assert.strictEqual(quiet.lastProtocolAt, "2026-09-22T00:00:01Z");
-    assert.strictEqual(api.statusText("connected", "unknown", "unknown"), "页面已打开 · 等待协议采集");
-    assert.strictEqual(api.statusText("connected", "unknown", "false"), "协议采集不可用");
+    assert.strictEqual(api.statusText("connected", "unknown", "unknown"), "页面已打开 · 等待互动数据");
+    assert.strictEqual(api.statusText("connected", "unknown", "false"), "直播页面已打开，但暂时没有获取到互动数据");
   }
-  assert.strictEqual(api.statusText("stopping"), "正在停止，暂时不能重新启动");
-  assert.strictEqual(api.statusText("stale"), api === douyin ? "采集可能中断" : "服务还活着，但最近没有可靠数据");
+  assert.strictEqual(api.statusText("stopping"), "正在停止");
+  assert.strictEqual(api.statusText("stale"), "采集可能中断");
   if (api === douyin) assert.strictEqual(api.statusText("connected", "quiet", "true"), "采集正常 · 最近暂无新互动");
-  assert.strictEqual(api.coverageText({ coverage_state: "unknown" }), "数据完整性未知");
-  assert.strictEqual(api.coverageText({ coverage_state: "gap" }), "存在采集缺口");
+  assert.strictEqual(api.coverageText({ coverage_state: "unknown" }), "暂时无法判断数据是否完整");
+  assert.strictEqual(api.coverageText({ coverage_state: "gap" }), "这段时间存在采集缺口");
   const cleared = api.clearSnapshotState(snapshot, "snapshot failed");
-  assert.deepStrictEqual(cleared.events, []);
-  assert.strictEqual(cleared.metrics, null);
+  assert.deepStrictEqual(cleared.events, [{ event_id: "new" }]);
+  assert.strictEqual(cleared.metrics.total, 2);
   assert.strictEqual(cleared.lastError, "snapshot failed");
   const reset = api.resetViewState(snapshot);
   assert.strictEqual(reset.roomId, "room-b");

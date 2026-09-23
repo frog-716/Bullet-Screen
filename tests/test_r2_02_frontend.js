@@ -24,7 +24,7 @@ for (const provider of ["bilibili", "douyin"]) {
   assert(html.includes("data-feedback=\"false_positive\""));
   assert(html.includes("data-feedback=\"note\""));
   assert(!html.includes("<script"));
-  assert.strictEqual(ui.coverageText("gap"), "采集存在缺口");
+  assert.strictEqual(ui.coverageText("gap"), "这段时间存在采集缺口");
   const source = fs.readFileSync(path.join(__dirname, "..", provider, "app.js"), "utf8");
   assert(source.includes("/api/signals/feedback"));
   assert(source.includes("BulletScreenSignals.renderCard"));

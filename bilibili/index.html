@@ -36,6 +36,13 @@
         <main class="dashboard" aria-label="实时运营看板">
           <div class="dashboard-head"><div><span class="eyebrow">OPERATIONS DASHBOARD</span><h2>直播现场，一眼盯住关键变化</h2></div><div class="dashboard-tools"><span class="snapshot-label" id="snapshotLabel">等待本地服务</span><select id="rangeSelect" aria-label="数据范围" disabled><option value="60s">最近 60 秒</option></select><button class="reset-button" id="resetButton" type="button" title="重新同步当前状态">↺</button></div></div>
 
+          <section class="truth-panel" id="truthPanel" data-tone="neutral" aria-labelledby="truthHeadline" aria-live="polite">
+            <div class="truth-main"><div><span class="eyebrow">当前采集</span><h3 id="truthHeadline">正在检查本地服务</h3><p id="truthGuidance">正在读取当前直播间状态。</p></div><div class="truth-actions" id="truthActions"></div></div>
+            <div class="truth-facts"><span><b id="truthPlatform">平台</b></span><span>直播间：<b id="truthRoom">—</b></span><span>统计范围：<b id="truthWindow">最近 60 秒</b></span><span id="truthCoverage">暂时无法判断数据是否完整</span><span id="truthAsOf">数据截至：暂无可靠数据</span><span id="lastReliableLabel" class="last-reliable hidden"></span></div>
+            <details class="diagnostic-details" id="diagnosticDetails"><summary>诊断详情</summary><div class="diagnostic-grid"><span>状态 <b id="diagnosticStatus">—</b></span><span>数据来源 <b id="diagnosticSource">—</b></span><span>会话 <b id="diagnosticSession">—</b></span><span>运行编号 <b id="diagnosticRun">—</b></span><span>代次 <b id="diagnosticGeneration">—</b></span><span>错误详情 <b id="diagnosticError">—</b></span></div></details>
+          </section>
+
+          <p class="metric-freshness-note hidden" id="metricFreshnessNote">以下数值是最后可靠值，不代表当前实时状态。</p>
           <section class="metric-grid" aria-label="核心指标">
             <article class="metric-card"><span class="metric-label">总场观</span><strong id="metricViews">—</strong><span class="metric-foot neutral">当前接口未提供</span></article><article class="metric-card"><span class="metric-label">直播热度</span><strong id="metricPeak">—</strong><span class="metric-foot neutral">B站热度值，非在线人数</span></article><article class="metric-card"><span class="metric-label">点赞事件</span><strong id="metricLikes">—</strong><span class="metric-foot neutral">当前连接收到的事件</span></article><article class="metric-card"><span class="metric-label">弹幕 / 分</span><strong id="metricRate">—</strong><span class="metric-foot neutral">最近 60 秒</span></article><article class="metric-card"><span class="metric-label">累计弹幕</span><strong id="metricDanmaku">—</strong><span class="metric-foot neutral">当前实时会话</span></article><article class="metric-card revenue"><span class="metric-label">礼物价值</span><strong id="metricRevenue">—</strong><span class="metric-foot neutral">币种未知时不估算金额</span></article>
           </section>
@@ -55,8 +62,8 @@
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <div class="modal-backdrop" id="settingsModal" aria-hidden="true"><section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle"><div class="modal-head"><div><span class="eyebrow">CONNECTION</span><h2 id="settingsTitle">连接设置</h2></div><button class="modal-close" id="closeSettings" type="button" aria-label="关闭">×</button></div><div class="modal-body"><label class="form-label" for="roomInput">B 站直播间 <span>链接或房间号</span></label><div class="input-with-action"><input id="roomInput" value="" placeholder="https://live.bilibili.com/123456 或 123456" inputmode="url" autocomplete="off" /><span>ROOM</span></div><p class="form-help">支持正常直播间链接或数字房间号；没有输入时不会自动连接任何房间。</p><label class="form-label" for="cookieInput">B 站 Cookie <span>可选</span></label><div class="input-with-action"><input id="cookieInput" type="password" placeholder="可粘贴完整 Cookie，或仅填写 SESSDATA" autocomplete="off" /><button id="toggleCookie" type="button">显示</button></div><p class="form-help warning-help">支持完整浏览器 Cookie 或仅 SESSDATA；只发送到本机服务进程，不写入 SQLite、不进入日志。</p><div class="security-note"><span>✓</span><div><strong>凭证安全</strong><p>浏览器不直连 B 站；Cookie 只在本机服务内存中用于请求，不会提交到远端。</p></div></div></div><div class="modal-actions"><button class="secondary-button" id="cancelSettings" type="button">取消</button><button class="primary-button" id="saveSettings" type="button">保存设置</button></div></section></div>
     <script src="./onboarding.js?v=20260922-1"></script>
-    <script src="./snapshot_client.js?v=20260921-1"></script>
-    <script src="./signal_ui.js?v=20260922-1"></script>
-    <script src="./app.js?v=20260922-1"></script>
+    <script src="./snapshot_client.js?v=20260923-1"></script>
+    <script src="./signal_ui.js?v=20260923-1"></script>
+    <script src="./app.js?v=20260923-1"></script>
   </body>
 </html>
