@@ -43,6 +43,13 @@ PROJECT_ROOT = ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from schema_v4 import SCHEMA_VERSION as V4_SCHEMA_VERSION, V4_TABLES, create_signal_schema, verify_signal_schema
+from scripts.data_lifecycle import (
+    LifecycleError,
+    acquire_profile_lock,
+    assert_no_pending_lifecycle,
+    release_lifecycle_lock,
+    resolve_profile_path,
+)
 
 DEFAULT_DB = ROOT / "data" / "danmaku.sqlite3"
 STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/onboarding.js": "onboarding.js", "/snapshot_client.js": "snapshot_client.js", "/signal_ui.js": "signal_ui.js", "/styles.css": "styles.css"}
@@ -1822,39 +1829,46 @@ def main() -> None:
         run_self_test()
         return
     database_lock = None
-    if args.provider == "douyin":
-        db_path = Path(":memory:") if args.mode == "demo" else Path(args.db)
-        if args.mode != "demo":
-            database_lock = acquire_database_lock(db_path.resolve())
-        try:
-            collector = DouyinCollector(db_path, mode=args.mode)
-        except Exception:
-            if database_lock is not None:
-                fcntl.flock(database_lock.fileno(), fcntl.LOCK_UN)
-                database_lock.close()
-            raise
-    else:
-        db_path = Path(args.db).resolve()
-        database_lock = acquire_database_lock(db_path)
-        try:
-            collector = Collector(EventStore(db_path))
-        except Exception:
-            fcntl.flock(database_lock.fileno(), fcntl.LOCK_UN)
-            database_lock.close()
-            raise
-    handler = type("BoundAppHandler", (AppHandler,), {"collector": collector, "capability_token": secrets.token_urlsafe(32)})
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    print(f"Live Intelligence local service: http://127.0.0.1:{server.server_address[1]}/", flush=True)
-    print(f"Provider: {args.provider} · mode: {args.mode}")
-    print(f"SQLite: {'memory only' if args.provider == 'douyin' and args.mode == 'demo' else Path(args.db).resolve()}")
+    profile_lock = None
+    collector = None
+    server = None
+    profile_override = Path(os.environ["DOUYIN_PROFILE_DIR"]).expanduser() if os.environ.get("DOUYIN_PROFILE_DIR") else None
+    profile_path = None
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        assert_no_pending_lifecycle(PROJECT_ROOT)
+        if args.provider == "douyin":
+            db_path = Path(":memory:") if args.mode == "demo" else Path(args.db).resolve()
+            if args.mode != "demo":
+                profile_path = resolve_profile_path(PROJECT_ROOT, profile_override)
+                database_lock = acquire_database_lock(db_path)
+                profile_lock = acquire_profile_lock(profile_path)
+                assert_no_pending_lifecycle(PROJECT_ROOT)
+            collector = DouyinCollector(db_path, mode=args.mode)
+        else:
+            db_path = Path(args.db).resolve()
+            database_lock = acquire_database_lock(db_path)
+            assert_no_pending_lifecycle(PROJECT_ROOT)
+            collector = Collector(EventStore(db_path))
+        handler = type("BoundAppHandler", (AppHandler,), {"collector": collector, "capability_token": secrets.token_urlsafe(32)})
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
+        print(f"Live Intelligence local service: http://127.0.0.1:{server.server_address[1]}/", flush=True)
+        print(f"Provider: {args.provider} · mode: {args.mode}")
+        print(f"SQLite: {'memory only' if args.provider == 'douyin' and args.mode == 'demo' else Path(args.db).resolve()}")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    except LifecycleError as error:
+        raise SystemExit(str(error)) from error
     finally:
-        collector.stop()
-        server.server_close()
-        collector.store.close()
+        if collector is not None:
+            collector.stop()
+            if hasattr(collector, "store"):
+                collector.store.close()
+        if server is not None:
+            server.server_close()
+        if profile_lock is not None:
+            release_lifecycle_lock(profile_lock)
         if database_lock is not None:
             fcntl.flock(database_lock.fileno(), fcntl.LOCK_UN)
             database_lock.close()

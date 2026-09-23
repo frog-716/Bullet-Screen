@@ -88,6 +88,14 @@ public final class LauncherLifecycleModel {
 }
 
 public enum LauncherPreflight {
+    public static func startupGuidance(for diagnostic: String) -> String? {
+        let normalized = diagnostic.lowercased()
+        let looksLikeUnsupportedOldSchema = normalized.contains("requires an explicit migration")
+            && (normalized.range(of: "schema\\s+[23]", options: .regularExpression) != nil)
+        guard looksLikeUnsupportedOldSchema else { return nil }
+        return "发现旧版数据。数据没有被自动修改，旧数据仍保留在原位置。可以先使用 Demo。当前不会自动迁移旧历史；如需使用新空数据库或迁移旧数据，请先阅读 docs/DATA.md 并完成独立备份。"
+    }
+
     public static func parsePort(_ raw: String?) -> Int? {
         let value = raw ?? "0"
         guard let port = Int(value), port == 0 || (1...65535).contains(port) else { return nil }

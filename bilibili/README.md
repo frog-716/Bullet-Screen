@@ -42,6 +42,8 @@ Python 3.9+、零第三方依赖；本批已在 Python 3.9.6 上实际验证。�
 
 ## SQLite
 
+数据库位置、备份/恢复、清理和旧库说明统一见项目级 [`docs/DATA.md`](../docs/DATA.md)。
+
 数据库自动创建并启用 WAL：
 
 - `sessions`：直播场次

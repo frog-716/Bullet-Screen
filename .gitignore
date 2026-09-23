@@ -7,6 +7,8 @@ __pycache__/
 **/data/*.lock
 **/data/browser-profile/
 **/.bullet-screen-db-migration/
+/.bullet-screen-data-lifecycle/
+/.bullet-screen-data-lifecycle-in-progress
 Bullet-Screen_Codex_小白执行包_2026-09-21/
 credentials.local.json
 .DS_Store

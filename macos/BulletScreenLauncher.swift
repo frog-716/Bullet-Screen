@@ -464,9 +464,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             run.errorBuffer = String(run.errorBuffer.suffix(4 * 1024))
         }
         if run.port != nil { return }
-        let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = run.errorBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { return }
-        setStatus("服务启动提示：\(String(message.suffix(220)))", error: true)
+        let guidance = LauncherPreflight.startupGuidance(for: message)
+        let visibleMessage = guidance ?? "服务启动提示：\(String(message.suffix(220)))"
+        setStatus(visibleMessage, error: true)
     }
 
     private func extractPort(from line: String) -> Int? {
@@ -715,9 +717,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = lifecycle.fail(run.identity)
             let detail = run.errorBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
             let phase = run.port == nil ? "服务在 ready 前退出" : "服务进程已退出"
-            let suffix = detail.isEmpty ? "" : "：\(String(detail.suffix(180)))"
+            let guidance = LauncherPreflight.startupGuidance(for: detail)
+            let message = guidance ?? "\(phase)（退出码 \(exitCode)）\(detail.isEmpty ? "" : "：\(String(detail.suffix(180)))")"
             cleanupRun(run)
-            setStatus("\(phase)（退出码 \(exitCode)）\(suffix)", error: true)
+            setStatus(message, error: true)
         }
         preflightInProgress = false
         updateControls()

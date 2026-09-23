@@ -41,6 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from schema_v4 import SCHEMA_VERSION as V4_SCHEMA_VERSION, V4_TABLES, create_signal_schema, verify_signal_schema
 from douyin.live_intelligence import SignalEngine, SignalFeedbackError, _window_bounds, add_signal_feedback, analyze_text, load_signals, persist_signal
+from scripts.data_lifecycle import LifecycleError, assert_no_pending_lifecycle
 
 DEFAULT_DB = ROOT / "data" / "danmaku.sqlite3"
 STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/onboarding.js": "onboarding.js", "/snapshot_client.js": "snapshot_client.js", "/signal_ui.js": "signal_ui.js", "/styles.css": "styles.css"}
@@ -1848,6 +1849,7 @@ def main() -> None:
     except ProtocolError as error:
         raise SystemExit(str(error))
     try:
+        assert_no_pending_lifecycle(PROJECT_ROOT)
         store = EventStore(db_path)
         collector = Collector(store)
         handler = type("BoundAppHandler", (AppHandler,), {"collector": collector, "capability_token": secrets.token_urlsafe(32)})
@@ -1862,6 +1864,8 @@ def main() -> None:
             collector.stop()
             server.server_close()
             store.close()
+    except LifecycleError as error:
+        raise SystemExit(str(error)) from error
     finally:
         fcntl.flock(database_lock.fileno(), fcntl.LOCK_UN)
         database_lock.close()

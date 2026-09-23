@@ -86,17 +86,13 @@ python3 server.py --mode demo
 
 ## 数据边界
 
-本地 SQLite 位于各子项目自己的 `data/` 目录，并被 Git 忽略。Bilibili 页面输入的 Cookie 和 Douyin 页面手工输入的 Cookie 只在对应本地服务进程内存中使用，不写入数据库、日志或仓库。
-
-Douyin 真实浏览器模式默认使用 `douyin/data/browser-profile/` 持久 Profile；该目录可能保存浏览器登录态和 Cookie。它不是“仅内存凭证”，关闭采集不会自动删除登录态。`--mode demo` 使用内存 SQLite，退出后清空；真实数据库和 Profile 都是本机运行数据，不应当当作静态网页资源或临时缓存处理。
+直播历史和 Douyin 登录状态默认保存在项目目录本机，不会随删除 App 自动清除。数据位置、备份、恢复、清理、退出登录、卸载和旧数据库说明见 [`docs/DATA.md`](docs/DATA.md)。
 
 本地页面通过同源 `/api/bootstrap` 获取本次服务启动生成的浏览器调用边界令牌，并只在页面内存中通过 `X-Bullet-Screen-Token` 调用敏感 API；令牌不放入 URL、localStorage、SQLite 或日志。它用于同源/跨站请求边界和 CSRF 类防护，不是防御同机恶意程序的认证系统。`/api/health` 可用于无令牌健康检查。
 
 ## 数据库治理
 
-当前服务支持的数据库 schema version 是 `4`。本机现有数据库可能仍处于 v2；v3 也不能被 v4 服务直接写入。打开已有数据库时会同时检查版本和 schema signature（表、列属性、索引、唯一约束、foreign key 与 check constraint）；版本过旧、未知、更新或结构损坏都会拒绝继续写入。空数据库和 `--mode demo` 仍可创建内存/新数据库。旧数据库不会被服务偷偷升级；迁移必须显式执行。
-
-迁移脚本位于 [`scripts/govern_databases.py`](scripts/govern_databases.py)，正式流程是锁定、复制 SQLite/WAL/SHM、只在隔离副本上验证和迁移、验证 candidate、持久化状态后切换，并保留原数据库用于恢复。v3 → v4 只创建空的 `signals`、`signal_evidence`、`signal_feedback` 表，不会根据旧事件脑补历史 signal；重复执行已是 v4 的目标会保持不变。本 checkpoint 没有对真实 v2/v3 数据库执行 migration；任何真实操作前都必须先使用隔离副本完成演练。
+当前服务使用 schema v4。旧数据库不会被偷偷升级；遇到 v2/v3 时服务会拒绝写入并保留原文件。真实 v2 → v4 尚未完成真实数据验证，普通用户请先使用 Demo；数据安全细节见 [`docs/DATA.md`](docs/DATA.md)。
 
 coverage API 区分四种状态：`reliable_with_data`（窗口完整且有事件）、`reliable_no_events`（有可靠采集证据但窗口内无事件）、`gap`（窗口与采集缺口重叠）和 `unknown`（没有足够证据判断完整性）。`unknown/null` 不等于数字 `0`；礼物数量、平台原始金额、币种和估算收入分别保留，不能互相替代。
 
@@ -108,6 +104,4 @@ v4 的 `signals` 保存规则推断本身，`signal_evidence` 通过对应数据
 
 - App 或服务打不开：运行 `./.venv/bin/python scripts/doctor.py`，根据第一个 `✗` 处理 Python、Playwright、Chromium、Swift、端口或入口文件问题。
 - Douyin 显示“页面已打开 · 等待协议采集”或“协议采集不可用”：这表示页面本身打开了，但当前房间没有被证明拥有可用的 HTTP protobuf 采集链。先确认直播确实在播、检查登录状态，必要时重新运行 `.venv/bin/python douyin/login.py`，或换一个公开直播间；不要把页面打开当成已采集。
-- 提示旧数据库 schema 版本：服务会拒绝写入，不会自动改库。先备份对应 `data/` 目录；当前版本没有在安装流程中自动迁移旧数据库，避免删除或覆盖历史数据。
-
-数据备份、清理和卸载的完整用户流程尚未在本批提供；卸载 App 不会自动删除 `bilibili/data/`、`douyin/data/` 或 Douyin 持久 Profile。
+- 提示旧数据库：服务不会自动修改它，原数据仍在原位置。先使用 Demo；备份与旧库说明见 [`docs/DATA.md`](docs/DATA.md)。
