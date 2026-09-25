@@ -102,6 +102,8 @@ v4 的 `signals` 保存规则推断本身，`signal_evidence` 通过对应数据
 
 ## 遇到问题怎么办
 
+当前版本接受的边界和未验证事项见[已知限制与后续计划](docs/KNOWN-LIMITATIONS.md)。
+
 - App 或服务打不开：运行 `./.venv/bin/python scripts/doctor.py`，根据第一个 `✗` 处理 Python、Playwright、Chromium、Swift、端口或入口文件问题。
 - Douyin 显示“页面已打开 · 等待协议采集”或“协议采集不可用”：这表示页面本身打开了，但当前房间没有被证明拥有可用的 HTTP protobuf 采集链。先确认直播确实在播、检查登录状态，必要时重新运行 `.venv/bin/python douyin/login.py`，或换一个公开直播间；不要把页面打开当成已采集。
 - 提示旧数据库：服务不会自动修改它，原数据仍在原位置。先使用 Demo；备份与旧库说明见 [`docs/DATA.md`](docs/DATA.md)。
