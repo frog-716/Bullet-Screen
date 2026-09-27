@@ -1,5 +1,41 @@
 import Foundation
 import Darwin
+import AppKit
+
+public enum LauncherEditingMenu {
+    public static func makeMainMenu() -> NSMenu {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Bullet-Screen")
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+        appMenu.addItem(NSMenuItem(
+            title: "退出 Bullet-Screen",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        ))
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        let commands: [(String, Selector, String)] = [
+            ("剪切", #selector(NSText.cut(_:)), "x"),
+            ("拷贝", #selector(NSText.copy(_:)), "c"),
+            ("粘贴", #selector(NSText.paste(_:)), "v"),
+            ("全选", #selector(NSTextView.selectAll(_:)), "a")
+        ]
+        for (title, action, key) in commands {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = [.command]
+            editMenu.addItem(item)
+        }
+
+        return mainMenu
+    }
+}
 
 public enum LauncherState: String, Equatable {
     case stopped

@@ -742,6 +742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct BulletScreenLauncherMain {
     static func main() {
         let application = NSApplication.shared
+        application.mainMenu = LauncherEditingMenu.makeMainMenu()
         let delegate = AppDelegate()
         application.delegate = delegate
         application.run()
