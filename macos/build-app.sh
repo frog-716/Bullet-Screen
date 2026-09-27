@@ -33,10 +33,12 @@ command -v codesign >/dev/null 2>&1 || die "找不到 codesign。请先安装 Xc
 [[ -f "$SCRIPT_DIR/Info.plist" ]] || die "缺少 macos/Info.plist。"
 [[ -f "$SCRIPT_DIR/LauncherLifecycle.swift" ]] || die "缺少 macos/LauncherLifecycle.swift。"
 [[ -f "$SCRIPT_DIR/BulletScreenLauncher.swift" ]] || die "缺少 macos/BulletScreenLauncher.swift。"
+[[ -f "$SCRIPT_DIR/BulletScreenIcon.icns" ]] || die "缺少 macos/BulletScreenIcon.icns。"
 
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 cp "$SCRIPT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$SCRIPT_DIR/BulletScreenIcon.icns" "$CONTENTS_DIR/Resources/BulletScreenIcon.icns"
 
 swiftc -O -framework Cocoa \
   -o "$CONTENTS_DIR/MacOS/BulletScreenLauncher" \
