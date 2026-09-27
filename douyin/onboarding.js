@@ -52,8 +52,9 @@
     try {
       const url = new URL(raw);
       if (!/^https?:$/.test(url.protocol) || url.hostname.toLowerCase() !== "live.douyin.com") return "";
-      const room = url.pathname.split("/").filter(Boolean)[0] || "";
-      return /^\d+$/.test(room) ? raw : "";
+      const segments = url.pathname.split("/").filter(Boolean);
+      const room = segments.length === 1 ? segments[0] : "";
+      return /^[A-Za-z0-9_-]{1,128}$/.test(room) ? raw : "";
     } catch (_) { return ""; }
   }
 

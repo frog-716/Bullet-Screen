@@ -83,8 +83,11 @@ class FakeResponse:
 
 
 class FakeLocator:
+    def __init__(self, body_text="在线观众 更多直播"):
+        self.body_text = body_text
+
     def inner_text(self, timeout=None):
-        return "在线观众 更多直播"
+        return self.body_text
 
 
 class FakeWebSocket:
@@ -102,11 +105,12 @@ class FakeWebSocket:
 
 
 class FakePage:
-    def __init__(self, stop_event, response_payload=None, websocket_frame=None):
+    def __init__(self, stop_event, response_payload=None, websocket_frame=None, body_text="在线观众 更多直播"):
         self.url = "about:blank"
         self._stop_event = stop_event
         self._response_payload = response_payload
         self._websocket_frame = websocket_frame
+        self._body_text = body_text
         self._handlers = {}
 
     def on(self, event, callback):
@@ -114,7 +118,7 @@ class FakePage:
 
     def goto(self, url, **kwargs):
         self.url = url
-        if url.endswith("123456"):
+        if url.startswith("https://live.douyin.com/"):
             if self._response_payload is not None:
                 for callback in self._handlers.get("response", []):
                     callback(FakeResponse(self._response_payload))
@@ -130,7 +134,7 @@ class FakePage:
         return "fixture room"
 
     def locator(self, selector):
-        return FakeLocator()
+        return FakeLocator(self._body_text)
 
     def evaluate(self, script):
         return {"online_text": "", "items": []}
@@ -166,15 +170,15 @@ class FakePlaywright:
         return None
 
 
-def run_fake_adapter(response_payload=None, websocket_frame=None):
+def run_fake_adapter(response_payload=None, websocket_frame=None, body_text="在线观众 更多直播", room_url="https://live.douyin.com/123456"):
     stop_event = threading.Event()
-    page = FakePage(stop_event, response_payload, websocket_frame)
+    page = FakePage(stop_event, response_payload, websocket_frame, body_text)
     context = FakeContext(page)
     fake_playwright = FakePlaywright(context)
     emitted = []
     activities = []
     states = []
-    instance = adapter.DouyinPublicAdapter("https://live.douyin.com/123456", mode="playwright")
+    instance = adapter.DouyinPublicAdapter(room_url, mode="playwright")
     sync_api = types.ModuleType("playwright.sync_api")
     sync_api.TimeoutError = TimeoutError
     sync_api.sync_playwright = None
@@ -246,6 +250,17 @@ class DouyinFreshnessFixTests(unittest.TestCase):
         self.assertEqual(activities, [])
         self.assertEqual(states, ["connected"])
         self.assertEqual([event["type"] for event in emitted], ["live_status"])
+
+    def test_valid_protocol_event_confirms_room_when_dom_ready_copy_is_missing(self):
+        payload = response([message("WebcastChatMessage", comment_payload(), 99)])
+        emitted, activities, states = run_fake_adapter(
+            response_payload=payload,
+            body_text="",
+            room_url="https://live.douyin.com/keyis153",
+        )
+        self.assertEqual(states, ["connected"])
+        self.assertEqual(activities, [True])
+        self.assertIn("comment", [event["type"] for event in emitted])
 
 
 if __name__ == "__main__":

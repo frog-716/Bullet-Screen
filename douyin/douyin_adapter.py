@@ -177,11 +177,28 @@ def parse_room_input(value: str) -> Tuple[str, str]:
         return raw, "https://live.douyin.com/" + raw
     parsed = urllib.parse.urlparse(raw if "://" in raw else "https://" + raw)
     host = parsed.netloc.lower().split(":", 1)[0]
-    if not (host == "douyin.com" or host.endswith(".douyin.com")):
+    if parsed.scheme not in ("http", "https") or not (host == "douyin.com" or host.endswith(".douyin.com")):
         raise AdapterError("请输入抖音公开直播间 URL 或数字 room_id")
     query = urllib.parse.parse_qs(parsed.query)
-    candidates = list(parsed.path.split("/")) + query.get("room_id", []) + query.get("live_id", [])
-    room_id = next((part for part in candidates if part.isdigit()), "")
+    path_parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+    path_room = path_parts[0] if len(path_parts) == 1 else ""
+    if path_room.isdigit():
+        room_id = path_room
+    elif re.fullmatch(r"[A-Za-z0-9_-]{1,128}", path_room):
+        # Douyin share links can use a public room alias rather than a numeric
+        # room id. Keep that navigable path instead of rewriting it to a URL
+        # that may not resolve to the same live room.
+        room_id = path_room
+    else:
+        room_id = next(
+            (
+                candidate
+                for key in ("room_id", "live_id")
+                for candidate in query.get(key, [])
+                if candidate.isdigit()
+            ),
+            "",
+        )
     if not room_id:
         raise AdapterError("无法从抖音 URL 解析 room_id；请使用 live.douyin.com/<room_id>")
     # Preserve only the public navigation hint used by links from the live
@@ -193,7 +210,8 @@ def parse_room_input(value: str) -> Tuple[str, str]:
         if re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", value):
             safe_query.append((key, value))
     suffix = "?" + urllib.parse.urlencode(safe_query) if safe_query else ""
-    return room_id, "https://live.douyin.com/" + room_id + suffix
+    room_path = urllib.parse.quote(room_id, safe="-_.~")
+    return room_id, "https://live.douyin.com/" + room_path + suffix
 
 
 def is_douyin_resource_url(value: str) -> bool:
@@ -943,11 +961,11 @@ class DouyinPublicAdapter:
                         on_state("offline", title)
                         emit({"type": "live_status", "content": "直播状态：已结束或暂时不可用", "metadata": {"source": "dom", "status": "offline"}})
                         return
-                    if any(marker in initial_body for marker in ready_markers):
+                    if any(marker in initial_body for marker in ready_markers) or protocol_state["active"]:
                         break
                     if stop_event.wait(0.5):
                         return
-                if not any(marker in initial_body for marker in ready_markers):
+                if not any(marker in initial_body for marker in ready_markers) and not protocol_state["active"]:
                     raise AdapterError("浏览器页面未加载直播内容；请使用 DOUYIN_HEADLESS=0 或配置 DOUYIN_PROFILE_DIR")
                 self._assert_target_room(page)
                 on_state("connected", title)
