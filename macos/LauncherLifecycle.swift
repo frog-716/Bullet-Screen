@@ -124,6 +124,26 @@ public final class LauncherLifecycleModel {
 }
 
 public enum LauncherPreflight {
+    public static func databaseOverride(demoMode: Bool, environment: [String: String]) -> String? {
+        guard !demoMode,
+              let configuredDatabase = environment["BULLET_SCREEN_DB"],
+              !configuredDatabase.isEmpty
+        else { return nil }
+        return configuredDatabase
+    }
+
+    public static func serverArguments(provider: String, demoMode: Bool, port: Int, environment: [String: String]) -> [String] {
+        var arguments = ["-u", "server.py", "--port", String(port)]
+        if provider == "douyin" {
+            arguments += ["--mode", demoMode ? "demo" : "auto"]
+        }
+        if let configuredDatabase = databaseOverride(demoMode: demoMode, environment: environment) {
+            let databasePath = URL(fileURLWithPath: configuredDatabase).standardizedFileURL.path
+            arguments += ["--db", databasePath]
+        }
+        return arguments
+    }
+
     public static func startupGuidance(for diagnostic: String) -> String? {
         let normalized = diagnostic.lowercased()
         let looksLikeUnsupportedOldSchema = normalized.contains("requires an explicit migration")

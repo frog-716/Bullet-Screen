@@ -324,7 +324,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard let port = LauncherPreflight.parsePort(ProcessInfo.processInfo.environment["BULLET_SCREEN_PORT"]) else {
+        let launcherEnvironment = ProcessInfo.processInfo.environment
+        guard let port = LauncherPreflight.parsePort(launcherEnvironment["BULLET_SCREEN_PORT"]) else {
             failPreflight("BULLET_SCREEN_PORT 不是有效端口；请使用 0 或 1-65535。")
             return
         }
@@ -346,22 +347,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let identity = lifecycle.beginStart()!
         let process = Process()
         process.executableURL = python
-        var arguments = ["-u", "server.py", "--port", String(port)]
-        if provider == "douyin" {
-            arguments += ["--mode", demoMode ? "demo" : "auto"]
-        }
-        if !demoMode,
-           let configuredDatabase = ProcessInfo.processInfo.environment["BULLET_SCREEN_DB"],
-           !configuredDatabase.isEmpty {
+        if let configuredDatabase = LauncherPreflight.databaseOverride(demoMode: demoMode, environment: launcherEnvironment) {
             let databaseURL = URL(fileURLWithPath: configuredDatabase).standardizedFileURL
             guard LauncherPreflight.hasDatabaseParent(databaseURL.path) else {
                 _ = lifecycle.fail(identity)
                 failPreflight("BULLET_SCREEN_DB 的父目录不存在：\(databaseURL.deletingLastPathComponent().path)")
                 return
             }
-            arguments += ["--db", databaseURL.path]
         }
-        process.arguments = arguments
+        process.arguments = LauncherPreflight.serverArguments(
+            provider: provider,
+            demoMode: demoMode,
+            port: port,
+            environment: launcherEnvironment
+        )
         process.currentDirectoryURL = providerRoot
 
         let stdout = Pipe()
